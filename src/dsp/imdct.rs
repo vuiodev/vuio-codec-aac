@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn output_symmetries_hold() {
         let n = 256;
-        let spectral: Vec<f32> = (0..n).map(|i| ((i * 37 % 101) as f32 - 50.0)).collect();
+        let spectral: Vec<f32> = (0..n).map(|i| (i * 37 % 101) as f32 - 50.0).collect();
         let ctx = ImdctContext::with_scale(n, 1.0);
         let mut out = vec![0.0f32; 2 * n];
         let mut scratch = vec![Complex32::default(); n];

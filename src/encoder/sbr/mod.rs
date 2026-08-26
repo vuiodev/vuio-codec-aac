@@ -3,14 +3,15 @@
 //! Analyzes baseband audio and high-frequency content, estimates envelope energies,
 //! detects missing harmonics, and generates standard SBR extension payloads (ISO/IEC 14496-3 Part 4).
 
-use crate::dsp::qmf::QmfAnalysis32;
+use crate::dsp::fft::Complex32;
+use crate::dsp::qmf::QmfAnalysis;
 use crate::error::Result;
 
 /// SBR Encoder Configuration and State.
 pub struct SbrEncoder {
     _sample_rate: u32,
     _bitrate: u32,
-    qmf_analysis: QmfAnalysis32,
+    qmf_analysis: QmfAnalysis,
 }
 
 impl SbrEncoder {
@@ -19,7 +20,7 @@ impl SbrEncoder {
         Self {
             _sample_rate: sample_rate,
             _bitrate: bitrate,
-            qmf_analysis: QmfAnalysis32::new(),
+            qmf_analysis: QmfAnalysis::new(),
         }
     }
 
@@ -31,10 +32,10 @@ impl SbrEncoder {
         let mut slot_energies = [0.0f32; 32];
         for (slot, slot_energy) in slot_energies.iter_mut().enumerate() {
             let chunk = &pcm_frame[slot * 32..(slot + 1) * 32];
-            let mut anal_out = [0.0f32; 32];
-            self.qmf_analysis.analyze(chunk, &mut anal_out);
+            let mut anal_out = [Complex32::default(); 32];
+            self.qmf_analysis.process_slot(chunk, &mut anal_out);
 
-            let energy: f32 = anal_out.iter().map(|&x| x * x).sum();
+            let energy: f32 = anal_out.iter().map(|c| c.re * c.re + c.im * c.im).sum();
             *slot_energy = energy;
         }
 

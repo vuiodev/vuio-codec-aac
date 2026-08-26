@@ -466,3 +466,36 @@ mod tests {
         }
     }
 }
+#[cfg(test)]
+mod dft_agreement {
+    use super::{Complex32, FftContext};
+
+    /// Every length the codec plans for must agree with the defining sum.
+    ///
+    /// Lengths that mix radices are the ones worth pinning: 128 and 512 end in a
+    /// radix-2 stage the pure radix-4 lengths never reach.
+    #[test]
+    fn fft_matches_direct_dft() {
+        for n in [16usize, 32, 64, 128, 256, 512] {
+            let ctx = FftContext::new(n);
+            let input: Vec<Complex32> = (0..n)
+                .map(|i| Complex32::new(((i * 37 % 23) as f32) - 11.0, ((i * 53 % 17) as f32) - 8.0))
+                .collect();
+            let mut out = vec![Complex32::default(); n];
+            ctx.forward_into(&input, &mut out);
+            let mut worst = 0.0f64;
+            for k in 0..n {
+                let mut re = 0.0f64;
+                let mut im = 0.0f64;
+                for (m, c) in input.iter().enumerate() {
+                    let a = -2.0 * std::f64::consts::PI * (k * m) as f64 / n as f64;
+                    re += c.re as f64 * a.cos() - c.im as f64 * a.sin();
+                    im += c.re as f64 * a.sin() + c.im as f64 * a.cos();
+                }
+                let d = ((out[k].re as f64 - re).powi(2) + (out[k].im as f64 - im).powi(2)).sqrt();
+                if d > worst { worst = d; }
+            }
+            assert!(worst < 1e-2 * n as f64, "FFT length {n} disagrees with the DFT: {worst}");
+        }
+    }
+}

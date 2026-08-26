@@ -2,3 +2,5 @@ c/
 target/
 test_vectors/
 text/
+vid/
+.DS_Store

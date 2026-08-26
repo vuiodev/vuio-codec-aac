@@ -4,7 +4,8 @@
 //! using QMF analysis/synthesis, HF patching/transposition, envelope time-frequency
 //! grid calculation, noise addition, and sinusoidal synthesis (ISO/IEC 14496-3 Part 4).
 
-use crate::dsp::qmf::{QmfAnalysis32, QmfSynthesis64};
+use crate::dsp::fft::Complex32;
+use crate::dsp::qmf::{QmfAnalysis, QmfSynthesis, SynthesisWidth};
 use crate::error::Result;
 
 /// SBR Header parameters transmitted in bitstream.
@@ -48,8 +49,8 @@ impl Default for SbrHeader {
 /// SBR High-Frequency Reconstructor and Synthesizer.
 pub struct SbrDecoder {
     header: SbrHeader,
-    qmf_analysis: QmfAnalysis32,
-    qmf_synthesis: QmfSynthesis64,
+    qmf_analysis: QmfAnalysis,
+    qmf_synthesis: QmfSynthesis,
     xover_band: usize,
 }
 
@@ -59,8 +60,8 @@ impl SbrDecoder {
         let xover = header.xover_band as usize;
         Self {
             header,
-            qmf_analysis: QmfAnalysis32::new(),
-            qmf_synthesis: QmfSynthesis64::new(),
+            qmf_analysis: QmfAnalysis::new(),
+            qmf_synthesis: QmfSynthesis::new(SynthesisWidth::Full),
             xover_band: xover.max(16),
         }
     }
@@ -85,13 +86,13 @@ impl SbrDecoder {
 
         for slot in 0..32 {
             let in_chunk = &baseband_pcm[slot * 32..(slot + 1) * 32];
-            let mut anal_out = [0.0f32; 32];
-            self.qmf_analysis.analyze(in_chunk, &mut anal_out);
+            let mut anal_out = [Complex32::default(); 32];
+            self.qmf_analysis.process_slot(in_chunk, &mut anal_out);
 
             // 1. Copy baseband QMF bands (0..xover_band)
             for k in 0..32 {
-                qmf_subbands_real[k] = anal_out[k];
-                qmf_subbands_imag[k] = 0.0;
+                qmf_subbands_real[k] = anal_out[k].re;
+                qmf_subbands_imag[k] = anal_out[k].im;
             }
 
             // 2. High-Frequency Transposition / Patching (harmonic replication)
@@ -100,13 +101,17 @@ impl SbrDecoder {
                 let source_band = (k - xover) % xover;
                 // High frequency replication with envelope gain adjustment
                 let env_gain = 0.75f32;
-                qmf_subbands_real[k] = anal_out[source_band] * env_gain;
-                qmf_subbands_imag[k] = 0.0;
+                qmf_subbands_real[k] = anal_out[source_band].re * env_gain;
+                qmf_subbands_imag[k] = anal_out[source_band].im * env_gain;
             }
 
             // 3. 64-band QMF Synthesis
             let out_chunk = &mut output_2x_pcm[slot * 64..(slot + 1) * 64];
-            self.qmf_synthesis.synthesize(&qmf_subbands_real, out_chunk);
+            let mut wide = [Complex32::default(); 64];
+            for k in 0..64 {
+                wide[k] = Complex32::new(qmf_subbands_real[k], qmf_subbands_imag[k]);
+            }
+            self.qmf_synthesis.process_slot(&wide, out_chunk);
         }
 
         Ok(())
