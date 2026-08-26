@@ -31,3 +31,12 @@ N.B.! This is Rust fork of original C project https://github.com/ittiam-systems/
 
 ## License
 Apache 2.0 or MIT
+
+## Attributions
+
+This product includes algorithmic designs and software derived from libxaac,
+originally developed by Ittiam Systems Pvt. Ltd. and licensed under the 
+Apache License, Version 2.0.
+
+Original Project: https://github.com/ittiam-systems/libxaac
+Copyright (c) Ittiam Systems Pvt. Ltd.
