@@ -5,11 +5,14 @@
 //! LPC analysis/synthesis, and polyphase audio resampling.
 
 pub mod fft;
+pub mod filterbank;
 pub mod lpc;
 pub mod math;
+pub mod imdct;
 pub mod mdct;
 pub mod qmf;
 pub mod resampler;
+pub mod simd;
 pub mod window;
 
 pub use fft::{Complex32, FftContext};

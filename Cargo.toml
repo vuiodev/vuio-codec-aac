@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["vyrti & Vuio Contributors"]
 license = "Apache-2.0 or MIT"
-description = "High-performance, bit-exact, pure Rust implementation of the MPEG AAC, HE-AAC v1/v2, AAC-ELD, USAC, and DRC audio codec family."
+description = "MPEG-4 AAC-LC decoder and encoder in Rust, ported and verified against the libxaac reference implementation."
 readme = "README.md"
 repository = "https://github.com/vuiodev/vuio-codec-aac"
 keywords = ["audio", "aac", "codec", "dsp", "usac"]
@@ -60,6 +60,11 @@ required-features = ["decoder", "clap", "hound", "tracing-subscriber"]
 name = "aacenc"
 path = "src/bin/aacenc.rs"
 required-features = ["encoder", "clap", "hound", "tracing-subscriber"]
+
+[[bin]]
+name = "compare_wav"
+path = "src/bin/compare_wav.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "verify_audio"

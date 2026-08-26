@@ -73,8 +73,17 @@ pub enum DecodeError {
     #[error("Huffman decoding error: invalid codeword for codebook {codebook} (bits: {bits:#x})")]
     HuffmanDecodeError { codebook: u8, bits: u32 },
 
-    #[error("Scalefactor out of valid range: {0} (valid: 0..255)")]
-    ScalefactorOutOfRange(i16),
+    #[error("Scalefactor out of valid range: {0} (valid: 0..=255)")]
+    ScalefactorOutOfRange(i32),
+
+    #[error("max_sfb {max_sfb} exceeds the {num_swb} bands available at this rate")]
+    InvalidMaxSfb { max_sfb: u8, num_swb: u8 },
+
+    #[error("section_data declared a zero-length section")]
+    InvalidSectionLength,
+
+    #[error("TNS filter order {0} exceeds the maximum for this window sequence")]
+    InvalidTnsOrder(u8),
 
     #[error("Invalid window sequence transition from {previous:?} to {current:?}")]
     InvalidWindowTransition {

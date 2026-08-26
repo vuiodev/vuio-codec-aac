@@ -119,6 +119,35 @@ impl<'a> BitReader<'a> {
         Ok(val)
     }
 
+    /// Peek the next 32 bits, left-aligned, zero-padding past the end of the buffer.
+    ///
+    /// Huffman decoding needs a fixed-width lookahead window and only consumes the
+    /// bits the decoded codeword actually occupies, so reading past the end is
+    /// normal on the final codeword of a frame. Padding with zeros (rather than
+    /// erroring) matches the reference decoder, which reads from a buffer whose
+    /// tail is zero-filled.
+    #[inline(always)]
+    pub fn peek32_padded(&self) -> u32 {
+        let byte_idx = self.bit_pos / 8;
+        let bit_in_byte = (self.bit_pos % 8) as u32;
+
+        // Fast path: eight bytes in hand covers any 32-bit window at any bit offset.
+        if byte_idx + 8 <= self.buffer.len() {
+            let chunk = u64::from_be_bytes(
+                self.buffer[byte_idx..byte_idx + 8].try_into().unwrap(),
+            );
+            return ((chunk << bit_in_byte) >> 32) as u32;
+        }
+
+        // Tail path: assemble from whatever bytes remain, zero-padding the rest.
+        let mut chunk: u64 = 0;
+        for i in 0..8 {
+            let b = self.buffer.get(byte_idx + i).copied().unwrap_or(0);
+            chunk = (chunk << 8) | b as u64;
+        }
+        ((chunk << bit_in_byte) >> 32) as u32
+    }
+
     /// Read up to 64 bits from the bitstream and advance the position.
     #[inline(always)]
     pub fn read_bits(&mut self, n: usize) -> Result<u64> {

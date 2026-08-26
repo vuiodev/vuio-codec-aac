@@ -1,269 +1,217 @@
-//! Modified Discrete Cosine Transform (MDCT & IMDCT)
+//! Forward MDCT.
 //!
-//! Implements Forward MDCT via 2N-point FFT (O(N log N)) and Inverse MDCT (IMDCT)
-//! with Time-Domain Aliasing Cancellation (TDAC), precomputed twiddle tables,
-//! and zero-allocation overlap-add buffers.
+//! Maps `2n` windowed time samples to `n` spectral coefficients:
 //!
-//! ## Forward MDCT Algorithm
+//! ```text
+//! X[k] = 2 * sum(i = 0..2n) x[i] * cos(pi/n * (i + 1/2 + n/2) * (k + 1/2))
+//! ```
 //!
-//! The forward MDCT is defined as:
-//! $$X[k] = \frac{2}{N} \sum_{n=0}^{2N-1} x[n] \cos\left(\frac{\pi}{N}(n + \frac{1}{2} + \frac{N}{2})(k + \frac{1}{2})\right)$$
+//! The factor of two is the analysis half of the normalization whose synthesis half
+//! is the `1/n` in [`crate::dsp::imdct`]; together they make windowed overlap-add
+//! reconstruct the original signal.
 //!
-//! This is decomposed into:
-//! 1. **Pre-twiddle**: $z[m] = x[m] \cdot e^{-j\pi m/(2N)}$ for $m = 0..2N-1$
-//! 2. **2N-point Forward FFT** on $z$
-//! 3. **Post-twiddle**: $X[k] = \frac{2}{N} \text{Re}[e^{j\theta_k} \cdot \overline{Z[k]}]$
-//!    where $\theta_k = \frac{\pi(k+0.5)(N+1)}{2N}$
+//! Computed through a `2n`-point complex FFT: pre-rotate the real input, transform,
+//! then take a rotated real part. The inverse transform uses a smaller `n/2`-point
+//! FFT; the forward direction is the encoder's cost and runs once per frame, so the
+//! simpler decomposition is kept for clarity.
 
-use std::f64::consts::PI as PI64;
 use crate::dsp::fft::{Complex32, FftContext};
+use std::f64::consts::PI;
 
-/// Context holding precomputed FFT twiddles and transform engine for fast MDCT/IMDCT.
+/// Precomputed rotations and FFT plan for one forward transform size.
 #[derive(Debug, Clone)]
 pub struct MdctContext {
-    /// Transform size N (number of spectral lines, e.g. 1024)
+    /// Number of spectral coefficients produced.
     pub n: usize,
-    /// N/2-point FFT context (used for IMDCT)
-    pub fft: FftContext,
-    /// 2N-point FFT context (used for forward MDCT)
-    pub fft_fwd: FftContext,
-    /// Legacy IMDCT twiddles
-    pub pre_twiddles: Vec<Complex32>,
-    pub post_twiddles: Vec<Complex32>,
-    /// Forward MDCT pre-twiddles: exp(-jπm/(2N)) for m = 0..2N-1
-    pub fwd_pre_tw: Vec<Complex32>,
-    /// Forward MDCT post-twiddles: (cos θ_k, sin θ_k) for k = 0..N-1
-    pub fwd_post_tw: Vec<Complex32>,
-    /// Precomputed 2N × N transposed cosine matrix for SIMD inverse MDCT dot-products
-    pub cos_imdct: Vec<f32>,
+    fft: FftContext,
+    /// `exp(-i*pi*m/(2n))` for `m` in `0..2n`.
+    pre: Vec<Complex32>,
+    /// `exp(i*theta_k)` with `theta_k = pi*(k + 1/2)*(n + 1)/(2n)`.
+    post: Vec<Complex32>,
+    /// Output scale.
+    scale: f32,
 }
 
 impl MdctContext {
-    /// Create MDCT context for transform size `n` (number of spectral lines, e.g. 1024 or 128).
+    /// Build a context producing `n` coefficients, with the standard analysis scale.
     pub fn new(n: usize) -> Self {
-        let n_half = n / 2;
-        let fft = FftContext::new(n_half);
-        let fft_fwd = FftContext::new(2 * n);
-
-        // Legacy IMDCT pre/post twiddles
-        let mut pre_twiddles = Vec::with_capacity(n_half);
-        for k in 0..n_half {
-            let angle = -PI64 * ((2.0 * k as f64 + 1.0) / (2.0 * n as f64));
-            pre_twiddles.push(Complex32::new(angle.cos() as f32, angle.sin() as f32));
-        }
-        let mut post_twiddles = Vec::with_capacity(n_half);
-        for k in 0..n_half {
-            let angle = -PI64 * ((2.0 * k as f64 + 1.0) / (2.0 * n as f64));
-            post_twiddles.push(Complex32::new(angle.cos() as f32, angle.sin() as f32));
-        }
-
-        // Forward MDCT pre-twiddles: exp(-jπm/(2N)) for m = 0..2N-1
-        // Using f64 precision for twiddle precomputation
-        let two_n = 2 * n;
-        let mut fwd_pre_tw = Vec::with_capacity(two_n);
-        for m in 0..two_n {
-            let angle = -PI64 * m as f64 / (2.0 * n as f64);
-            fwd_pre_tw.push(Complex32::new(angle.cos() as f32, angle.sin() as f32));
-        }
-
-        // Forward MDCT post-twiddles: (cos θ_k, sin θ_k) for k = 0..N-1
-        // θ_k = π(k+0.5)(N+1)/(2N)
-        let mut fwd_post_tw = Vec::with_capacity(n);
-        for k in 0..n {
-            let theta = PI64 * (k as f64 + 0.5) * (n as f64 + 1.0) / (2.0 * n as f64);
-            fwd_post_tw.push(Complex32::new(theta.cos() as f32, theta.sin() as f32));
-        }
-
-        // Transposed Inverse cosine matrix: cos_imdct[i * N + k]
-        let mut cos_imdct = vec![0.0f32; 2 * n * n];
-        for i in 0..2 * n {
-            let i_offset = i * n;
-            let i_term = (i as f64 + 0.5 + (n as f64) / 2.0) * PI64 / (n as f64);
-            for k in 0..n {
-                let angle = (k as f64 + 0.5) * i_term;
-                cos_imdct[i_offset + k] = angle.cos() as f32;
-            }
-        }
-
-        Self {
-            n,
-            fft,
-            fft_fwd,
-            pre_twiddles,
-            post_twiddles,
-            fwd_pre_tw,
-            fwd_post_tw,
-            cos_imdct,
-        }
+        Self::with_scale(n, 2.0)
     }
 
-    /// FFT-based Forward MDCT: O(N log N) via 2N-point complex FFT.
+    /// Build a context with an explicit output scale.
+    pub fn with_scale(n: usize, scale: f32) -> Self {
+        assert!(n >= 4 && n.is_power_of_two(), "MDCT size must be a power of two >= 4");
+        let two_n = 2 * n;
+
+        let pre = (0..two_n)
+            .map(|m| {
+                let a = -PI * m as f64 / two_n as f64;
+                Complex32::new(a.cos() as f32, a.sin() as f32)
+            })
+            .collect();
+
+        let post = (0..n)
+            .map(|k| {
+                let theta = PI * (k as f64 + 0.5) * (n as f64 + 1.0) / two_n as f64;
+                Complex32::new(theta.cos() as f32, theta.sin() as f32)
+            })
+            .collect();
+
+        Self { n, fft: FftContext::new(two_n), pre, post, scale }
+    }
+
+    /// Transform `2n` windowed samples into `n` coefficients.
     ///
-    /// Transforms 2N windowed time-domain samples into N spectral coefficients.
-    /// `scratch` must have length >= 2N.
-    ///
-    /// Derivation:
-    /// ```text
-    /// X[k] = (2/N) Re[exp(jθ_k) · conj(DFT₂ₙ[x[m]·exp(-jπm/(2N))]_k)]
-    /// where θ_k = π(k+0.5)(N+1)/(2N)
-    /// ```
-    #[inline(always)]
-    pub fn forward_mdct_fft(&self, time_in_2n: &[f32], spec_out_n: &mut [f32], scratch: &mut [Complex32]) {
+    /// `scratch` must hold at least `4n` complex values: `2n` for the rotated input
+    /// and `2n` for the FFT output.
+    pub fn forward(&self, time: &[f32], spec: &mut [f32], scratch: &mut [Complex32]) {
         let n = self.n;
         let two_n = 2 * n;
-        let scale = 2.0 / n as f32;
+        assert_eq!(time.len(), two_n);
+        assert_eq!(spec.len(), n);
+        assert!(scratch.len() >= 2 * two_n);
 
-        assert_eq!(time_in_2n.len(), two_n);
-        assert_eq!(spec_out_n.len(), n);
-        assert!(scratch.len() >= two_n);
-
-        // Step 1: Pre-twiddle — multiply real input by precomputed exp(-jπm/(2N))
+        let (input, output) = scratch[..2 * two_n].split_at_mut(two_n);
         for m in 0..two_n {
-            let tw = &self.fwd_pre_tw[m];
-            let x = time_in_2n[m];
-            scratch[m] = Complex32::new(x * tw.re, x * tw.im);
+            let w = self.pre[m];
+            let x = time[m];
+            input[m] = Complex32::new(x * w.re, x * w.im);
         }
 
-        // Step 2: 2N-point forward FFT
-        self.fft_fwd.forward(&mut scratch[..two_n]);
+        self.fft.forward_into(input, output);
 
-        // Step 3: Post-twiddle — extract MDCT coefficients
-        // X[k] = (2/N) * [cos(θ_k) * Z[k].re + sin(θ_k) * Z[k].im]
         for k in 0..n {
-            let tw = &self.fwd_post_tw[k];
-            let z = &scratch[k];
-            spec_out_n[k] = (z.re * tw.re + z.im * tw.im) * scale;
+            let w = self.post[k];
+            let z = output[k];
+            spec[k] = (z.re * w.re + z.im * w.im) * self.scale;
         }
     }
 
-    /// 16-Way SIMD FMA-Unrolled Inverse MDCT: transforms N spectral coefficients into 2N time-domain samples.
-    #[inline(always)]
-    pub fn imdct(&self, input: &[f32], output: &mut [f32]) {
-        let n = self.n;
-        assert_eq!(input.len(), n, "Input must have N spectral coefficients");
-        assert_eq!(output.len(), 2 * n, "Output must hold 2N time samples");
-
-        let chunks_16 = n / 16;
-
-        for (i, out) in output.iter_mut().enumerate().take(2 * n) {
-            let row = &self.cos_imdct[i * n..(i + 1) * n];
-            let mut sum0 = 0.0f32;
-            let mut sum1 = 0.0f32;
-            let mut sum2 = 0.0f32;
-            let mut sum3 = 0.0f32;
-            let mut sum4 = 0.0f32;
-            let mut sum5 = 0.0f32;
-            let mut sum6 = 0.0f32;
-            let mut sum7 = 0.0f32;
-
-            for c in 0..chunks_16 {
-                let idx = c * 16;
-                sum0 += input[idx] * row[idx] + input[idx + 8] * row[idx + 8];
-                sum1 += input[idx + 1] * row[idx + 1] + input[idx + 9] * row[idx + 9];
-                sum2 += input[idx + 2] * row[idx + 2] + input[idx + 10] * row[idx + 10];
-                sum3 += input[idx + 3] * row[idx + 3] + input[idx + 11] * row[idx + 11];
-                sum4 += input[idx + 4] * row[idx + 4] + input[idx + 12] * row[idx + 12];
-                sum5 += input[idx + 5] * row[idx + 5] + input[idx + 13] * row[idx + 13];
-                sum6 += input[idx + 6] * row[idx + 6] + input[idx + 14] * row[idx + 14];
-                sum7 += input[idx + 7] * row[idx + 7] + input[idx + 15] * row[idx + 15];
-            }
-            *out = (sum0 + sum1 + sum2 + sum3) + (sum4 + sum5 + sum6 + sum7);
-        }
+    /// Scratch length [`Self::forward`] requires.
+    pub const fn scratch_len(&self) -> usize {
+        4 * self.n
     }
+}
 
-    /// Process IMDCT with windowing and overlap-add buffer update using caller-supplied scratch buffer.
-    #[inline(always)]
-    pub fn process_overlap_add_scratch(
-        &self,
-        spectral: &[f32],
-        window: &[f32],
-        overlap_history: &mut [f32],
-        output_pcm: &mut [f32],
-        scratch_2n: &mut [f32],
-    ) {
-        let n = self.n;
-        self.imdct(spectral, scratch_2n);
-
-        // Apply window and overlap-add
-        for i in 0..n {
-            let win_sample = scratch_2n[i] * window[i];
-            output_pcm[i] = win_sample + overlap_history[i];
-            overlap_history[i] = scratch_2n[n + i] * window[n + i];
+/// Brute-force forward MDCT from the definition, for tests.
+pub fn mdct_reference(time: &[f32], spec: &mut [f64], scale: f64) {
+    let n = spec.len();
+    for (k, s) in spec.iter_mut().enumerate() {
+        let mut acc = 0.0f64;
+        for (i, &x) in time.iter().enumerate() {
+            let a = PI / n as f64 * (i as f64 + 0.5 + n as f64 / 2.0) * (k as f64 + 0.5);
+            acc += x as f64 * a.cos();
         }
-    }
-
-    /// Process IMDCT with windowing and overlap-add buffer update.
-    pub fn process_overlap_add(
-        &self,
-        spectral: &[f32],
-        window: &[f32],
-        overlap_history: &mut [f32],
-        output_pcm: &mut [f32],
-    ) {
-        let n = self.n;
-        let mut imdct_out = vec![0.0f32; 2 * n];
-        self.process_overlap_add_scratch(
-            spectral,
-            window,
-            overlap_history,
-            output_pcm,
-            &mut imdct_out,
-        );
+        *s = acc * scale;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsp::imdct::ImdctContext;
 
-    /// Verify FFT-based forward MDCT matches brute-force O(N²) direct cosine matrix multiplication.
+    fn signal(len: usize, seed: u32) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let t = i as f32 + seed as f32 * 1.7;
+                (t * 0.037).sin() * 10000.0 + (t * 0.13).cos() * 5000.0 + (t * 0.9).sin() * 700.0
+            })
+            .collect()
+    }
+
+    /// The fast transform must match the definition at every size the codec uses.
     #[test]
-    fn test_forward_mdct_fft_matches_brute_force() {
-        for &n in &[128, 256, 512, 1024] {
-            let mdct = MdctContext::new(n);
-            let two_n = 2 * n;
+    fn matches_the_definition() {
+        for &n in &[16usize, 64, 128, 256, 512, 1024] {
+            let time = signal(2 * n, 1);
+            let mut want = vec![0.0f64; n];
+            mdct_reference(&time, &mut want, 2.0);
 
-            // Generate test signal
-            let time_in: Vec<f32> = (0..two_n)
-                .map(|i| ((i as f32 * 0.037).sin() * 10000.0 + (i as f32 * 0.13).cos() * 5000.0))
-                .collect();
+            let ctx = MdctContext::new(n);
+            let mut got = vec![0.0f32; n];
+            let mut scratch = vec![Complex32::default(); ctx.scratch_len()];
+            ctx.forward(&time, &mut got, &mut scratch);
 
-            // Brute-force reference
-            let mut spec_ref = vec![0.0f32; n];
-            let scale = 2.0 / n as f32;
-            for k in 0..n {
-                let mut sum = 0.0f64;
-                for i in 0..two_n {
-                    let angle = std::f64::consts::PI / n as f64
-                        * (i as f64 + 0.5 + n as f64 / 2.0)
-                        * (k as f64 + 0.5);
-                    sum += time_in[i] as f64 * angle.cos();
-                }
-                spec_ref[k] = (sum * scale as f64) as f32;
+            let peak = want.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-9);
+            for (k, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                let e = (*g as f64 - w).abs() / peak;
+                assert!(e < 2e-5, "n={n} k={k}: {g} vs {w} (rel {e:.3e})");
             }
+        }
+    }
 
-            // FFT-based
-            let mut spec_fft = vec![0.0f32; n];
-            let mut scratch = vec![Complex32::new(0.0, 0.0); two_n];
-            mdct.forward_mdct_fft(&time_in, &mut spec_fft, &mut scratch);
+    /// Forward then inverse, with the matching normalizations, must satisfy the
+    /// time-domain aliasing identity: the sum of two overlapped frames reconstructs.
+    #[test]
+    fn forward_and_inverse_normalizations_pair_up() {
+        let n = 256;
+        let fwd = MdctContext::new(n);
+        let inv = ImdctContext::new(n);
 
-            // Compare
-            let mut max_err = 0.0f32;
-            for k in 0..n {
-                let err = (spec_fft[k] - spec_ref[k]).abs();
-                if err > max_err {
-                    max_err = err;
-                }
-            }
+        let time = signal(2 * n, 3);
+        let mut spec = vec![0.0f32; n];
+        let mut fscratch = vec![Complex32::default(); fwd.scratch_len()];
+        fwd.forward(&time, &mut spec, &mut fscratch);
 
-            let max_abs = spec_ref.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            let rel_err = max_err / max_abs.max(1e-10);
+        let mut back = vec![0.0f32; 2 * n];
+        let mut iscratch = vec![Complex32::default(); n];
+        inv.imdct(&spec, &mut back, &mut iscratch);
 
+        // A single unwindowed round trip does not return the input: the MDCT is
+        // critically sampled, so half the information is folded away as time-domain
+        // aliasing. What comes back in the first half is exactly the input minus its
+        // own reflection. Overlap-add with the neighbouring frame is what cancels
+        // that fold; `tests/filterbank_reconstruction.rs` covers the cancellation.
+        for i in 0..n {
+            let expected = time[i] - time[n - 1 - i];
+            let tol = expected.abs() * 1e-3 + 1.0;
             assert!(
-                rel_err < 1e-4,
-                "FFT MDCT mismatch for N={}: max_err={:.6e}, max_abs={:.2}, rel_err={:.6e}",
-                n, max_err, max_abs, rel_err
+                (back[i] - expected).abs() < tol,
+                "i={i}: {} vs {expected}",
+                back[i]
             );
         }
+
+        // The fold is antisymmetric about the midpoint of the first half.
+        for i in 0..n / 2 {
+            assert!(
+                (back[i] + back[n - 1 - i]).abs() < back[i].abs() * 1e-3 + 1.0,
+                "aliasing is not antisymmetric at {i}"
+            );
+        }
+    }
+
+    /// The transform is linear.
+    #[test]
+    fn is_linear() {
+        let n = 128;
+        let ctx = MdctContext::new(n);
+        let mut scratch = vec![Complex32::default(); ctx.scratch_len()];
+
+        let a = signal(2 * n, 1);
+        let b = signal(2 * n, 9);
+        let sum: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+
+        let (mut fa, mut fb, mut fs) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        ctx.forward(&a, &mut fa, &mut scratch);
+        ctx.forward(&b, &mut fb, &mut scratch);
+        ctx.forward(&sum, &mut fs, &mut scratch);
+
+        let peak = fs.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+        for k in 0..n {
+            assert!((fa[k] + fb[k] - fs[k]).abs() / peak < 1e-4, "k={k}");
+        }
+    }
+
+    /// Silence in, silence out.
+    #[test]
+    fn silence_produces_silence() {
+        let n = 64;
+        let ctx = MdctContext::new(n);
+        let mut scratch = vec![Complex32::default(); ctx.scratch_len()];
+        let mut spec = vec![1.0f32; n];
+        ctx.forward(&vec![0.0; 2 * n], &mut spec, &mut scratch);
+        assert!(spec.iter().all(|v| v.abs() < 1e-6));
     }
 }

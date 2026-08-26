@@ -1,5 +1,7 @@
 //! Exhaustive DSP Transforms and Mathematics Test Suite
 
+use vuiocodecaac::dsp::filterbank::Filterbank;
+use vuiocodecaac::types::{WindowSequence, WindowShape};
 use vuiocodecaac::dsp::*;
 use std::f32::consts::PI;
 
@@ -47,46 +49,53 @@ fn test_fft_ifft_roundtrip_all_sizes() {
 
 #[test]
 fn test_mdct_imdct_tdac_reconstruction() {
+    // Windowed MDCT with overlap-add is a perfect-reconstruction system: the
+    // aliasing each frame's transform introduces is cancelled by the neighbouring
+    // frame. The first frame has no predecessor, so frame 1 is the first that can
+    // reconstruct.
     let frame_len = 1024;
     let mdct = MdctContext::new(frame_len);
+    let mut filterbank = Filterbank::new(frame_len);
     let sine_win = generate_sine_window_f32(2 * frame_len);
 
     let mut signal = vec![0.0f32; 3 * frame_len];
     for (i, x) in signal.iter_mut().enumerate() {
-        *x = (2.0 * PI * 440.0 * (i as f32 / 44100.0)).sin();
+        *x = (2.0 * PI * 440.0 * (i as f32 / 44100.0)).sin() * 1000.0;
     }
 
     let mut overlap = vec![0.0f32; frame_len];
     let mut reconstructed = vec![0.0f32; 2 * frame_len];
-    let mut scratch_fft = vec![vuiocodecaac::dsp::fft::Complex32::new(0.0, 0.0); 2 * frame_len];
+    let mut scratch = vec![vuiocodecaac::dsp::fft::Complex32::new(0.0, 0.0); mdct.scratch_len()];
 
-    // Frame 0: window and forward MDCT
-    let mut win_in0 = vec![0.0f32; 2 * frame_len];
-    for (w, (&s, &win)) in win_in0.iter_mut().zip(signal[0..2 * frame_len].iter().zip(sine_win.iter())) {
-        *w = s * win;
+    for frame in 0..2 {
+        let start = frame * frame_len;
+        let mut windowed = vec![0.0f32; 2 * frame_len];
+        for (w, (&s, &win)) in windowed
+            .iter_mut()
+            .zip(signal[start..start + 2 * frame_len].iter().zip(sine_win.iter()))
+        {
+            *w = s * win;
+        }
+
+        let mut spec = vec![0.0f32; frame_len];
+        mdct.forward(&windowed, &mut spec, &mut scratch);
+
+        let mut pcm = vec![0.0f32; frame_len];
+        filterbank.synthesize(
+            &spec,
+            WindowSequence::OnlyLongSequence,
+            WindowShape::Sine,
+            WindowShape::Sine,
+            &mut overlap,
+            &mut pcm,
+        );
+        reconstructed[start..start + frame_len].copy_from_slice(&pcm);
     }
-    let mut spec0 = vec![0.0f32; frame_len];
-    mdct.forward_mdct_fft(&win_in0, &mut spec0, &mut scratch_fft);
-    let mut pcm0 = vec![0.0f32; frame_len];
-    mdct.process_overlap_add(&spec0, &sine_win, &mut overlap, &mut pcm0);
-    reconstructed[0..frame_len].copy_from_slice(&pcm0);
 
-    // Frame 1: window and forward MDCT
-    let mut win_in1 = vec![0.0f32; 2 * frame_len];
-    for (w, (&s, &win)) in win_in1.iter_mut().zip(signal[frame_len..3 * frame_len].iter().zip(sine_win.iter())) {
-        *w = s * win;
-    }
-    let mut spec1 = vec![0.0f32; frame_len];
-    mdct.forward_mdct_fft(&win_in1, &mut spec1, &mut scratch_fft);
-    let mut pcm1 = vec![0.0f32; frame_len];
-    mdct.process_overlap_add(&spec1, &sine_win, &mut overlap, &mut pcm1);
-    reconstructed[frame_len..2 * frame_len].copy_from_slice(&pcm1);
-
-    // Verify reconstructed frame 1 (perfect TDAC overlap-add)
     for i in 0..frame_len {
         let orig = signal[frame_len + i];
         let rec = reconstructed[frame_len + i];
-        assert!((orig - rec).abs() < 1e-3, "TDAC mismatch at index {}", i);
+        assert!((orig - rec).abs() < 0.5, "TDAC mismatch at index {i}: {orig} vs {rec}");
     }
 }
 

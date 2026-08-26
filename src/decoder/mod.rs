@@ -10,6 +10,7 @@
 
 pub mod aac;
 pub mod drc;
+pub mod batch;
 pub mod engine;
 pub mod mps;
 pub mod ps;

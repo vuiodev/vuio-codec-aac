@@ -1,6 +1,7 @@
 //! MPEG-4 AAC Core Encoding Subsystem
 
 pub mod bitstream;
+pub mod huffman;
 pub mod block_switch;
 pub mod psycho;
 pub mod quant;
@@ -11,4 +12,4 @@ pub use bitstream::{
 };
 pub use block_switch::BlockSwitching;
 pub use psycho::PsychoacousticModel;
-pub use quant::{estimate_global_gain, quantize_band};
+pub use quant::{BandChoice, choose_codebook, quantize_band, write_band};

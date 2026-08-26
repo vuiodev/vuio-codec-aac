@@ -1,7 +1,22 @@
-//! # vuiocodecaac: High-Performance, Bit-Exact Pure Rust Audio Codec
+//! # vuiocodecaac
 //!
-//! `vuiocodecaac` is a memory-safe, 100% idiomatic Rust 2024 implementation of the MPEG AAC,
-//! HE-AAC v1/v2 (SBR + PS), AAC-ELD, MPEG-D USAC, and MPEG-D DRC audio codec suite.
+//! An MPEG-4 AAC-LC decoder and encoder, ported from the reference C
+//! implementation [libxaac](https://github.com/ittiam-systems/libxaac).
+//!
+//! ## Scope
+//!
+//! The decoder implements AAC-LC: all four window sequences, both window shapes,
+//! the full spectral and scalefactor Huffman codebooks, section data, temporal
+//! noise shaping, mid/side and intensity stereo, noise substitution and pulse
+//! data, framed in ADTS. It is verified against the C reference; see the README
+//! for the measured figures.
+//!
+//! Spectral Band Replication (HE-AAC), Parametric Stereo, MPEG Surround, USAC and
+//! DRC are **not implemented**. An HE-AAC stream decodes to its AAC-LC core at
+//! half the nominal sample rate, because the SBR payload travels in fill elements
+//! the decoder steps over. The encoder emits conformant AAC-LC but has no
+//! psychoacoustic model, so its quality at a given bitrate is well below a mature
+//! encoder's.
 //!
 //! ## Quickstart: Decoding an AAC Stream
 //!
@@ -26,7 +41,12 @@
 //! let adts_packet = encoder.encode_frame(&pcm_input).unwrap();
 //! ```
 
-#![forbid(unsafe_code)]
+// `unsafe` is denied crate-wide and allowed in exactly one place: `dsp::simd`,
+// which wraps SIMD intrinsics. Those intrinsics are `unsafe` because they can
+// require CPU features the machine may lack and because their load/store forms take
+// raw pointers; that module documents how both obligations are discharged, and every
+// kernel it contains is checked against a scalar reference in its tests.
+#![deny(unsafe_code)]
 
 pub mod bitstream;
 pub mod buffer;

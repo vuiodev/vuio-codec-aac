@@ -9,21 +9,20 @@ fn main() {
     // Generate test data
     let time_2n: Vec<f32> = (0..2*n).map(|i| (i as f32 * 0.01).sin()).collect();
     let mut spec_n = vec![0.0f32; n];
-    let mut scratch_fft = vec![Complex32::new(0.0, 0.0); 2 * n];
-    
     let mdct = MdctContext::new(n);
+    let mut scratch_fft = vec![Complex32::new(0.0, 0.0); mdct.scratch_len()];
     
     let iterations = 500;
     
     // Warmup
     for _ in 0..10 {
-        mdct.forward_mdct_fft(black_box(&time_2n), black_box(&mut spec_n), black_box(&mut scratch_fft));
+        mdct.forward(black_box(&time_2n), black_box(&mut spec_n), black_box(&mut scratch_fft));
     }
     
     // Benchmark FFT-based forward MDCT
     let start = Instant::now();
     for _ in 0..iterations {
-        mdct.forward_mdct_fft(black_box(&time_2n), black_box(&mut spec_n), black_box(&mut scratch_fft));
+        mdct.forward(black_box(&time_2n), black_box(&mut spec_n), black_box(&mut scratch_fft));
         black_box(&spec_n);
     }
     let elapsed_mdct = start.elapsed();
@@ -45,15 +44,16 @@ fn main() {
     let quant_us = elapsed_quant.as_secs_f64() * 1e6 / iterations as f64;
     println!("quantize_band:                 {:>10.1} µs/call", quant_us);
     
-    // Benchmark estimate_global_gain
+    // Benchmark codebook selection, which the rate loop runs once per band per
+    // bisection step.
     let start = Instant::now();
     for _ in 0..iterations {
-        let g = vuiocodecaac::encoder::aac::quant::estimate_global_gain(black_box(&spectrum), black_box(2000));
-        black_box(g);
+        let c = vuiocodecaac::encoder::aac::quant::choose_codebook(black_box(&quantized[..64]));
+        black_box(c.bits);
     }
     let elapsed_gain = start.elapsed();
     let gain_us = elapsed_gain.as_secs_f64() * 1e6 / iterations as f64;
-    println!("estimate_global_gain:          {:>10.1} µs/call", gain_us);
+    println!("choose_codebook (64 lines):    {:>10.1} µs/call", gain_us);
     
     // Benchmark psychoacoustic analyze
     let sfb_offsets: Vec<usize> = (0..=49).map(|i| (i * 21).min(n)).collect();
