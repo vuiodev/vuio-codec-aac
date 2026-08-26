@@ -1,6 +1,6 @@
 # vuiocodecaac: High-Performance Pure Rust MPEG AAC Audio Codec Suite
 
-N.B.! This is Rust fork of original C project https://github.com/ittiam-systems/libvuiocodecaac
+N.B.! This is Rust fork of original C project https://github.com/ittiam-systems/libxaac
 
 `vuiocodecaac` is a 100% pure, memory-safe, idiomatic Rust implementation of the MPEG AAC audio codec suite, providing bit-exact output, extreme throughput, SIMD auto-vectorization, Rayon multi-threading, and zero-allocation aligned buffer architectures.
 
