@@ -1,8 +1,8 @@
 //! Exhaustive Syntax Headers and Containers Test Suite
 
-use xaac::bitstream::{BitReader, BitWriter};
-use xaac::syntax::*;
-use xaac::types::{AudioObjectType, ChannelConfiguration, FrameLength, SamplingRate};
+use vuiocodecaac::bitstream::{BitReader, BitWriter};
+use vuiocodecaac::syntax::*;
+use vuiocodecaac::types::{AudioObjectType, ChannelConfiguration, FrameLength, SamplingRate};
 
 #[test]
 fn test_adts_header_exhaustive_sampling_rates() {

@@ -1,11 +1,11 @@
-//! Structured Error Hierarchy for XAAC Audio Codec
+//! Structured Error Hierarchy for vuiocodecaac Audio Codec
 //!
 //! Provides comprehensive, strongly typed errors for bitstream demuxing, decoding,
 //! encoding, DSP transforms, and container parsing using `thiserror`.
 
 use thiserror::Error;
 
-/// Root error type for all operations within the `xaac` crate.
+/// Root error type for all operations within the `vuiocodecaac` crate.
 #[derive(Debug, Error)]
 pub enum Error {
     /// Bitstream parsing and extraction errors.
@@ -165,5 +165,5 @@ pub enum DspError {
     FilterbankError(String),
 }
 
-/// Result alias for `xaac` operations.
+/// Result alias for `vuiocodecaac` operations.
 pub type Result<T> = std::result::Result<T, Error>;

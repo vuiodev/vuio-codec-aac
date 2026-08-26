@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use clap::Parser;
 use hound::WavReader;
-use xaac::prelude::*;
+use vuiocodecaac::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(

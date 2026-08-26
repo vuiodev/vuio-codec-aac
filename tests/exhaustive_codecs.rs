@@ -1,23 +1,23 @@
 //! Exhaustive Codec Subsystems and Tools Test Suite
 
-use xaac::decoder::aac::dequant::inverse_quantize;
-use xaac::decoder::aac::huffman::decode_spectral_band;
-use xaac::decoder::aac::pns::PnsGenerator;
-use xaac::decoder::aac::stereo::{apply_intensity_stereo, apply_ms_stereo};
-use xaac::decoder::aac::tns::TnsFilter;
-use xaac::decoder::drc::DrcDecoder;
-use xaac::decoder::mps::{MpsDecoder, MpsSpatialCues};
-use xaac::decoder::ps::PsDecoder;
-use xaac::decoder::sbr::{SbrDecoder, SbrHeader};
-use xaac::decoder::usac::{UsacCoreMode, UsacDecoder};
-use xaac::encoder::aac::block_switch::BlockSwitching;
-use xaac::encoder::aac::psycho::PsychoacousticModel;
-use xaac::encoder::aac::quant::{estimate_global_gain, quantize_band};
-use xaac::encoder::drc::DrcEncoder;
-use xaac::encoder::ps::PsEncoder;
-use xaac::encoder::sbr::SbrEncoder;
-use xaac::encoder::usac::UsacEncoder;
-use xaac::bitstream::{BitReader, BitWriter};
+use vuiocodecaac::decoder::aac::dequant::inverse_quantize;
+use vuiocodecaac::decoder::aac::huffman::decode_spectral_band;
+use vuiocodecaac::decoder::aac::pns::PnsGenerator;
+use vuiocodecaac::decoder::aac::stereo::{apply_intensity_stereo, apply_ms_stereo};
+use vuiocodecaac::decoder::aac::tns::TnsFilter;
+use vuiocodecaac::decoder::drc::DrcDecoder;
+use vuiocodecaac::decoder::mps::{MpsDecoder, MpsSpatialCues};
+use vuiocodecaac::decoder::ps::PsDecoder;
+use vuiocodecaac::decoder::sbr::{SbrDecoder, SbrHeader};
+use vuiocodecaac::decoder::usac::{UsacCoreMode, UsacDecoder};
+use vuiocodecaac::encoder::aac::block_switch::BlockSwitching;
+use vuiocodecaac::encoder::aac::psycho::PsychoacousticModel;
+use vuiocodecaac::encoder::aac::quant::{estimate_global_gain, quantize_band};
+use vuiocodecaac::encoder::drc::DrcEncoder;
+use vuiocodecaac::encoder::ps::PsEncoder;
+use vuiocodecaac::encoder::sbr::SbrEncoder;
+use vuiocodecaac::encoder::usac::UsacEncoder;
+use vuiocodecaac::bitstream::{BitReader, BitWriter};
 
 #[test]
 fn test_huffman_and_dequantization() {
@@ -148,6 +148,6 @@ fn test_psychoacoustic_and_quantization() {
 
     let mut block_switch = BlockSwitching::new();
     let (seq, shape) = block_switch.analyze(&spec);
-    assert_eq!(seq, xaac::types::WindowSequence::OnlyLongSequence);
-    assert_eq!(shape, xaac::types::WindowShape::Sine);
+    assert_eq!(seq, vuiocodecaac::types::WindowSequence::OnlyLongSequence);
+    assert_eq!(shape, vuiocodecaac::types::WindowShape::Sine);
 }

@@ -1,10 +1,10 @@
-//! Benchmarks for XAAC Codec Transforms and Pipeline
+//! Benchmarks for vuiocodecaac Codec Transforms and Pipeline
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use xaac::prelude::*;
-use xaac::dsp::fft::FftContext;
-use xaac::dsp::mdct::MdctContext;
-use xaac::dsp::Complex32;
+use vuiocodecaac::prelude::*;
+use vuiocodecaac::dsp::fft::FftContext;
+use vuiocodecaac::dsp::mdct::MdctContext;
+use vuiocodecaac::dsp::Complex32;
 
 fn bench_fft(c: &mut Criterion) {
     let fft = FftContext::new(512);

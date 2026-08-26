@@ -137,16 +137,7 @@ impl Encoder {
             }
 
             let mut spectral = vec![0.0f32; frame_len];
-            for (k, spec) in spectral.iter_mut().enumerate().take(frame_len) {
-                let mut sum = 0.0f32;
-                for (n, &win_sample) in windowed.iter().enumerate().take(2 * frame_len) {
-                    let angle = std::f32::consts::PI / (frame_len as f32)
-                        * (n as f32 + 0.5 + (frame_len as f32) / 2.0)
-                        * (k as f32 + 0.5);
-                    sum += win_sample * angle.cos();
-                }
-                *spec = sum * (2.0 / frame_len as f32).sqrt();
-            }
+            self._mdct.forward_mdct(&windowed, &mut spectral);
 
             // 3. Psychoacoustic Analysis & Scalefactor Quantization
             let _psy_result = self.psycho.analyze(&spectral, &sfb_offsets[..num_sfb]);

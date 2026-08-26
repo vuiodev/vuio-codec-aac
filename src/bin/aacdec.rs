@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use clap::Parser;
 use hound::{WavSpec, WavWriter};
-use xaac::prelude::*;
+use vuiocodecaac::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(name = "aacdec", author, version, about = "High-performance MPEG AAC / USAC / DRC Audio Decoder in pure Rust", long_about = None)]

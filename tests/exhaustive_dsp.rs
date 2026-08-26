@@ -1,6 +1,6 @@
 //! Exhaustive DSP Transforms and Mathematics Test Suite
 
-use xaac::dsp::*;
+use vuiocodecaac::dsp::*;
 use std::f32::consts::PI;
 
 #[test]

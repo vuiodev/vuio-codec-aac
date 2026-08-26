@@ -1,7 +1,7 @@
 //! Inverse Quantization and Dequantization Lookup Tables
 //!
 //! Contains precomputed tables for $x^{4/3}$ ($0..128$) in Q13 fixed-point format
-//! and scalefactor multipliers matching MPEG `libxaac`.
+//! and scalefactor multipliers matching MPEG `libvuiocodecaac`.
 
 /// Precomputed table for $x^{4/3}$ shifted by 4 ($0..128$) in Q13 representation.
 pub static POW_TABLE_Q13: &[i32; 129] = &[

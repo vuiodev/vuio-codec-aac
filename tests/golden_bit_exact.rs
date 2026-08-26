@@ -1,11 +1,11 @@
 //! Golden Bit-Exact Test Harness
 //!
-//! Asserts bit-level equivalence between Rust `xaac` and reference C `libxaac`
+//! Asserts bit-level equivalence between Rust `vuiocodecaac` and reference C `libvuiocodecaac`
 //! tables, math primitives, and decoded/encoded streams.
 
-use xaac::dsp::math::*;
-use xaac::tables::dequant::POW_TABLE_Q13;
-use xaac::tables::scalefactor::*;
+use vuiocodecaac::dsp::math::*;
+use vuiocodecaac::tables::dequant::POW_TABLE_Q13;
+use vuiocodecaac::tables::scalefactor::*;
 
 #[test]
 fn test_pow_table_q13_reference_values() {

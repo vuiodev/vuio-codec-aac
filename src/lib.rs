@@ -1,12 +1,12 @@
-//! # XAAC: High-Performance, Bit-Exact Pure Rust Audio Codec
+//! # vuiocodecaac: High-Performance, Bit-Exact Pure Rust Audio Codec
 //!
-//! `xaac` is a memory-safe, 100% idiomatic Rust 2024 implementation of the MPEG AAC,
+//! `vuiocodecaac` is a memory-safe, 100% idiomatic Rust 2024 implementation of the MPEG AAC,
 //! HE-AAC v1/v2 (SBR + PS), AAC-ELD, MPEG-D USAC, and MPEG-D DRC audio codec suite.
 //!
 //! ## Quickstart: Decoding an AAC Stream
 //!
 //! ```no_run
-//! use xaac::prelude::*;
+//! use vuiocodecaac::prelude::*;
 //!
 //! let mut decoder = Decoder::new_default();
 //! let adts_packet = [0xFF, 0xF1, 0x50, 0x80, 0x02, 0x1F, 0xFC /* ... */];
@@ -18,7 +18,7 @@
 //! ## Quickstart: Encoding Audio to AAC
 //!
 //! ```no_run
-//! use xaac::prelude::*;
+//! use vuiocodecaac::prelude::*;
 //!
 //! let config = EncoderConfig::default();
 //! let mut encoder = Encoder::new(config).unwrap();

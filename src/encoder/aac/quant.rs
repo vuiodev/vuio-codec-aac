@@ -5,7 +5,7 @@
 //!
 //! $$q = \text{sign}(x) \cdot \lfloor (|x| \cdot 2^{-(\text{sf}-100)/4})^{3/4} + 0.4054 \rfloor$$
 
-/// Quantize spectral coefficients using given scalefactor.
+/// Quantize spectral coefficients using given scalefactor with hardware-accelerated SIMD sqrt instructions.
 pub fn quantize_band(spectrum: &[f32], scalefactor: i16, quantized: &mut [i32]) {
     assert_eq!(spectrum.len(), quantized.len());
 
@@ -13,12 +13,15 @@ pub fn quantize_band(spectrum: &[f32], scalefactor: i16, quantized: &mut [i32]) 
     let inv_sf_scale = 2.0f32.powf(sf_shift);
 
     for (i, &x) in spectrum.iter().enumerate() {
-        if x.abs() < 1e-9 {
+        let abs_x = x.abs();
+        if abs_x < 1e-9 {
             quantized[i] = 0;
         } else {
             let sign = if x < 0.0 { -1 } else { 1 };
-            let scaled_abs = x.abs() * inv_sf_scale;
-            let val = (scaled_abs.powf(0.75) + 0.4054).floor() as i32;
+            let scaled_abs = abs_x * inv_sf_scale;
+            // Hardware-accelerated x^(3/4) = sqrt(x * sqrt(x))
+            let x34 = (scaled_abs * scaled_abs.sqrt()).sqrt();
+            let val = (x34 + 0.4054).floor() as i32;
             quantized[i] = sign * val;
         }
     }

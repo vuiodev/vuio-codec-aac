@@ -1,7 +1,7 @@
 //! Exact Fixed-Point Q-Format DSP Arithmetic Engine
 //!
 //! Provides bit-exact saturating, normalized, and fractional arithmetic identical
-//! to MPEG `libxaac` for sample-accurate bit-perfect decoding and encoding.
+//! to MPEG `libvuiocodecaac` for sample-accurate bit-perfect decoding and encoding.
 
 pub const MAX_32: i32 = i32::MAX; // 0x7FFF_FFFF
 pub const MIN_32: i32 = i32::MIN; // -0x8000_0000
