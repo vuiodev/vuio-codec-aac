@@ -11,8 +11,8 @@
   - **HE-AAC v1** (Spectral Band Replication / SBR)
   - **HE-AAC v2** (Parametric Stereo / PS)
   - **AAC-LD / AAC-ELD** (Low Delay / Enhanced Low Delay communication)
-  - **MPEG-D USAC** (Unified Speech and Audio Coding)
-  - **MPEG-D DRC / UniDRC** (Dynamic Range Control & Loudness metadata)
+  - **MPEG-D USAC** (Unified Speech and Audio Coding: ACELP / TCX / FD)
+  - **MPEG-D DRC / UniDRC** (Dynamic Range Control & BS.1770 Loudness Normalization)
 - **Container Multiplexers & Syntaxes**:
   - **ADTS** (Audio Data Transport Stream with CRC-16)
   - **ADIF** (Audio Data Interchange Format)
