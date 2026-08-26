@@ -155,6 +155,12 @@ impl BitWriter {
         &self.buffer
     }
 
+    /// Finalize writer and return mutable slice to the byte buffer.
+    pub fn finalize_mut(&mut self) -> &mut [u8] {
+        self.byte_align_zero();
+        &mut self.buffer
+    }
+
     /// Consume writer and return the completed byte vector.
     pub fn into_bytes(mut self) -> Vec<u8> {
         self.byte_align_zero();

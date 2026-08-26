@@ -1,18 +1,20 @@
 //! Command-line AAC Audio Encoder Tool (`aacenc`)
 //!
-//! Encodes multi-channel PCM WAV audio to standard-compliant MPEG-4 AAC / HE-AAC bitstreams.
+//! Encodes multi-channel PCM WAV audio to standard-compliant MPEG-4 AAC / HE-AAC bitstreams
+//! with optional Rayon multi-threaded parallel batch execution.
 
-use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
 use clap::Parser;
 use hound::WavReader;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+use std::time::Instant;
 use vuiocodecaac::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "aacenc",
-    author = "Antigravity AAC Team",
+    author = "Vuio AAC",
     version,
     about = "High-performance MPEG AAC / HE-AAC / USAC Audio Encoder in pure Rust (2024)",
     long_about = None
@@ -40,18 +42,11 @@ struct Args {
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    let start_time = Instant::now();
     let args = Args::parse();
-
-    println!("Encoding {:?} -> {:?}", args.input, args.output);
 
     let mut wav_reader = WavReader::open(&args.input)?;
     let spec = wav_reader.spec();
-
-    println!(
-        "Input format: {} Hz, {} channels, {} bits",
-        spec.sample_rate, spec.channels, spec.bits_per_sample
-    );
 
     let sampling_rate = SamplingRate::from_hz(spec.sample_rate);
     let channel_config = ChannelConfiguration::from_u8(spec.channels as u8)
@@ -75,31 +70,78 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         frame_length: FrameLength::Samples1024,
     };
 
-    let mut encoder = Encoder::new(config)?;
-    let mut out_file = File::create(&args.output)?;
-
     let samples: Vec<i16> = wav_reader.samples::<i16>().map(|s| s.unwrap_or(0)).collect();
     let num_ch = spec.channels as usize;
     let frame_len = 1024;
-    let total_frames = samples.len() / (num_ch * frame_len);
+    let frame_stride = num_ch * frame_len;
+    let total_frames = samples.len() / frame_stride;
 
-    let mut pcm_frame = AudioBuffer::<i16>::new(num_ch, frame_len);
-    let mut encoded_frames = 0;
+    let encoded_packets: Vec<Vec<u8>> = if args.threads == 1 {
+        let mut encoder = Encoder::new(config)?;
+        let mut pcm_frame = AudioBuffer::<i16>::new(num_ch, frame_len);
+        let mut packets = Vec::with_capacity(total_frames);
+        for f in 0..total_frames {
+            let start = f * frame_stride;
+            pcm_frame.from_interleaved(&samples[start..start + frame_stride]);
+            packets.push(encoder.encode_frame(&pcm_frame)?);
+        }
+        packets
+    } else {
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+            let base_encoder = Encoder::new(config.clone())?;
+            let num_threads = if args.threads > 0 { args.threads } else { rayon::current_num_threads() };
+            let chunk_frames = (total_frames / num_threads.max(1)).max(1);
+            let chunk_samples = chunk_frames * frame_stride;
 
-    for f in 0..total_frames {
-        let start = f * num_ch * frame_len;
-        let frame_slice = &samples[start..start + num_ch * frame_len];
-        pcm_frame.from_interleaved(frame_slice);
+            samples
+                .par_chunks(chunk_samples)
+                .flat_map_iter(|chunk| {
+                    let mut enc = base_encoder.clone();
+                    let mut pcm = AudioBuffer::<i16>::new(num_ch, frame_len);
+                    let n_frames = chunk.len() / frame_stride;
+                    let mut local_packets = Vec::with_capacity(n_frames);
+                    for f in 0..n_frames {
+                        let start = f * frame_stride;
+                        pcm.from_interleaved(&chunk[start..start + frame_stride]);
+                        local_packets.push(enc.encode_frame(&pcm).unwrap());
+                    }
+                    local_packets
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            let mut encoder = Encoder::new(config)?;
+            let mut pcm_frame = AudioBuffer::<i16>::new(num_ch, frame_len);
+            let mut packets = Vec::with_capacity(total_frames);
+            for f in 0..total_frames {
+                let start = f * frame_stride;
+                pcm_frame.from_interleaved(&samples[start..start + frame_stride]);
+                packets.push(encoder.encode_frame(&pcm_frame)?);
+            }
+            packets
+        }
+    };
 
-        let adts_packet = encoder.encode_frame(&pcm_frame)?;
-        out_file.write_all(&adts_packet)?;
-        encoded_frames += 1;
+    let out_file = File::create(&args.output)?;
+    let mut buf_writer = BufWriter::with_capacity(65536, out_file);
+    for packet in &encoded_packets {
+        buf_writer.write_all(packet)?;
     }
+    buf_writer.flush()?;
+
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let audio_duration = (total_frames * frame_len) as f64 / spec.sample_rate as f64;
+    let speed = audio_duration / elapsed.max(1e-6);
 
     println!(
-        "Successfully encoded {} frames ({:.2}s, profile: {:?}, {} kbps) to {:?}",
-        encoded_frames,
-        (encoded_frames * frame_len) as f32 / spec.sample_rate as f32,
+        "Encoded {} frames ({:.2}s audio in {:.3}s, speed={:.1}x real-time, profile: {:?}, {} kbps) -> {:?}",
+        total_frames,
+        audio_duration,
+        elapsed,
+        speed,
         aot,
         args.bitrate / 1000,
         args.output

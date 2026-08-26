@@ -1,7 +1,7 @@
 //! Zero-Copy High-Performance Bitstream Reader
 //!
-//! Provides bounds-checked, zero-copy bit extraction from byte slices
-//! with support for arbitrary bit widths (1..64), sub-byte peeking, and byte alignment.
+//! Provides bounds-checked, zero-copy, branchless bit extraction from byte slices
+//! with support for arbitrary bit widths (1..64), fast 64-bit word peeking, and byte alignment.
 
 use crate::error::{BitstreamError, Result};
 
@@ -69,7 +69,8 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Peek up to 64 bits without advancing the read position.
+    /// Fast branchless bit peeker extracting up to 64 bits without advancing position.
+    #[inline]
     pub fn peek_bits(&self, n: usize) -> Result<u64> {
         if n == 0 {
             return Ok(0);
@@ -86,17 +87,28 @@ impl<'a> BitReader<'a> {
             .into());
         }
 
+        let byte_idx = self.bit_pos / 8;
+        let bit_in_byte = self.bit_pos % 8;
+
+        // Fast path: 8-byte word available in buffer
+        if byte_idx + 8 <= self.buffer.len() {
+            let chunk = u64::from_be_bytes(self.buffer[byte_idx..byte_idx + 8].try_into().unwrap());
+            let val = (chunk << bit_in_byte) >> (64 - n);
+            return Ok(val);
+        }
+
+        // Tail path: buffer edge case
         let mut val: u64 = 0;
         let mut curr_pos = self.bit_pos;
         let mut bits_left = n;
 
         while bits_left > 0 {
-            let byte_idx = curr_pos / 8;
-            let bit_in_byte = curr_pos % 8;
-            let take = (8 - bit_in_byte).min(bits_left);
-            let byte = self.buffer[byte_idx];
+            let b_idx = curr_pos / 8;
+            let b_bit = curr_pos % 8;
+            let take = (8 - b_bit).min(bits_left);
+            let byte = self.buffer[b_idx];
             let mask = ((1u16 << take) - 1) as u8;
-            let shift = 8 - bit_in_byte - take;
+            let shift = 8 - b_bit - take;
             let extracted = ((byte >> shift) & mask) as u64;
 
             val = (val << take) | extracted;
@@ -108,7 +120,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read up to 64 bits from the bitstream and advance the position.
-    #[inline]
+    #[inline(always)]
     pub fn read_bits(&mut self, n: usize) -> Result<u64> {
         let val = self.peek_bits(n)?;
         self.bit_pos += n;
@@ -116,33 +128,45 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read a single boolean bit (`true` if 1, `false` if 0).
-    #[inline]
+    #[inline(always)]
     pub fn read_bit(&mut self) -> Result<bool> {
-        Ok(self.read_bits(1)? == 1)
+        let bit_idx = self.bit_pos;
+        if bit_idx >= self.total_bits {
+            return Err(BitstreamError::UnexpectedEof {
+                needed_bits: 1,
+                available_bits: 0,
+            }
+            .into());
+        }
+        let byte = self.buffer[bit_idx / 8];
+        let shift = 7 - (bit_idx % 8);
+        self.bit_pos += 1;
+        Ok(((byte >> shift) & 1) == 1)
     }
 
     /// Read an unsigned integer up to 8 bits.
-    #[inline]
+    #[inline(always)]
     pub fn read_u8(&mut self, n: usize) -> Result<u8> {
         assert!(n <= 8, "Bit width must be <= 8");
         Ok(self.read_bits(n)? as u8)
     }
 
     /// Read an unsigned integer up to 16 bits.
-    #[inline]
+    #[inline(always)]
     pub fn read_u16(&mut self, n: usize) -> Result<u16> {
         assert!(n <= 16, "Bit width must be <= 16");
         Ok(self.read_bits(n)? as u16)
     }
 
     /// Read an unsigned integer up to 32 bits.
-    #[inline]
+    #[inline(always)]
     pub fn read_u32(&mut self, n: usize) -> Result<u32> {
         assert!(n <= 32, "Bit width must be <= 32");
         Ok(self.read_bits(n)? as u32)
     }
 
     /// Skip `n` bits forward in the stream.
+    #[inline(always)]
     pub fn skip_bits(&mut self, n: usize) -> Result<()> {
         let available = self.bits_remaining();
         if available < n {
@@ -158,8 +182,12 @@ impl<'a> BitReader<'a> {
 
     /// Get slice of remaining unread bytes starting from the current byte boundary.
     pub fn get_remaining_bytes(&self) -> &'a [u8] {
-        let start = self.byte_position().min(self.buffer.len());
-        &self.buffer[start..]
+        let byte_pos = self.byte_position();
+        if byte_pos >= self.buffer.len() {
+            &[]
+        } else {
+            &self.buffer[byte_pos..]
+        }
     }
 }
 
@@ -169,25 +197,25 @@ mod tests {
 
     #[test]
     fn test_bit_reader_basic() {
-        let data = [0b1011_0010, 0b1111_0000];
+        let data = [0b10110010, 0b11110000, 0b10101010, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
         let mut reader = BitReader::new(&data);
 
-        assert_eq!(reader.bits_remaining(), 16);
-        assert!(reader.is_byte_aligned());
+        assert_eq!(reader.bits_remaining(), data.len() * 8);
+        assert!(reader.read_bit().unwrap());
+        assert!(!reader.read_bit().unwrap());
+        assert!(reader.read_bit().unwrap());
+        assert!(reader.read_bit().unwrap());
 
-        assert_eq!(reader.read_bits(3).unwrap(), 0b101);
-        assert_eq!(reader.read_bits(5).unwrap(), 0b10010);
-        assert!(reader.is_byte_aligned());
-
-        assert_eq!(reader.read_u8(4).unwrap(), 0b1111);
-        assert_eq!(reader.read_u8(4).unwrap(), 0b0000);
-        assert_eq!(reader.bits_remaining(), 0);
+        assert_eq!(reader.read_u8(4).unwrap(), 0b0010);
+        assert_eq!(reader.read_u8(8).unwrap(), 0b11110000);
+        assert_eq!(reader.read_u16(16).unwrap(), 0b1010101000000001);
     }
 
     #[test]
     fn test_bit_reader_eof() {
-        let data = [0xAA];
+        let data = [0xFF];
         let mut reader = BitReader::new(&data);
-        assert!(reader.read_bits(9).is_err());
+        assert!(reader.read_bits(8).is_ok());
+        assert!(reader.read_bit().is_err());
     }
 }

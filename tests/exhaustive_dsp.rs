@@ -58,6 +58,7 @@ fn test_mdct_imdct_tdac_reconstruction() {
 
     let mut overlap = vec![0.0f32; frame_len];
     let mut reconstructed = vec![0.0f32; 2 * frame_len];
+    let mut scratch_fft = vec![vuiocodecaac::dsp::fft::Complex32::new(0.0, 0.0); 2 * frame_len];
 
     // Frame 0: window and forward MDCT
     let mut win_in0 = vec![0.0f32; 2 * frame_len];
@@ -65,7 +66,7 @@ fn test_mdct_imdct_tdac_reconstruction() {
         *w = s * win;
     }
     let mut spec0 = vec![0.0f32; frame_len];
-    mdct.forward_mdct(&win_in0, &mut spec0);
+    mdct.forward_mdct_fft(&win_in0, &mut spec0, &mut scratch_fft);
     let mut pcm0 = vec![0.0f32; frame_len];
     mdct.process_overlap_add(&spec0, &sine_win, &mut overlap, &mut pcm0);
     reconstructed[0..frame_len].copy_from_slice(&pcm0);
@@ -76,7 +77,7 @@ fn test_mdct_imdct_tdac_reconstruction() {
         *w = s * win;
     }
     let mut spec1 = vec![0.0f32; frame_len];
-    mdct.forward_mdct(&win_in1, &mut spec1);
+    mdct.forward_mdct_fft(&win_in1, &mut spec1, &mut scratch_fft);
     let mut pcm1 = vec![0.0f32; frame_len];
     mdct.process_overlap_add(&spec1, &sine_win, &mut overlap, &mut pcm1);
     reconstructed[frame_len..2 * frame_len].copy_from_slice(&pcm1);

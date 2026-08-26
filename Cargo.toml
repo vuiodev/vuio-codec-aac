@@ -2,7 +2,7 @@
 name = "vuiocodecaac"
 version = "0.1.0"
 edition = "2024"
-authors = ["vyrti & Contributors"]
+authors = ["vyrti & Vuio Contributors"]
 license = "Apache-2.0 or MIT"
 description = "High-performance, bit-exact, pure Rust implementation of the MPEG AAC, HE-AAC v1/v2, AAC-ELD, USAC, and DRC audio codec family."
 readme = "README.md"
@@ -75,6 +75,11 @@ required-features = ["cli"]
 name = "bench_compare"
 path = "src/bin/bench_compare.rs"
 required-features = ["cli", "encoder", "decoder"]
+
+[[bin]]
+name = "profile_encoder"
+path = "src/bin/profile_encoder.rs"
+required-features = ["cli", "encoder"]
 
 
 

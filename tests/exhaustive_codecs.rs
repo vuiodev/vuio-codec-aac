@@ -139,7 +139,7 @@ fn test_psychoacoustic_and_quantization() {
     let spec = vec![0.5f32; 1024];
     let sfb_offsets: Vec<usize> = (0..=49).map(|i| (i * 1024) / 49).collect();
     let result = psycho.analyze(&spec, &sfb_offsets);
-    assert_eq!(result.masking_thresholds.len(), 49);
+    assert_eq!(result.num_bands, 49);
 
     let gain = estimate_global_gain(&spec, 2000);
     let mut quantized = vec![0i32; 1024];

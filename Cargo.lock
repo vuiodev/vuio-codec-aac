@@ -840,6 +840,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "vuiocodecaac"
+version = "0.1.0"
+dependencies = [
+ "aligned-vec",
+ "bitflags",
+ "byteorder",
+ "bytes",
+ "clap",
+ "criterion",
+ "hound",
+ "rayon",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -926,24 +944,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "vuiocodecaac"
-version = "0.1.0"
-dependencies = [
- "aligned-vec",
- "bitflags",
- "byteorder",
- "bytes",
- "clap",
- "criterion",
- "hound",
- "rayon",
- "tempfile",
- "thiserror",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

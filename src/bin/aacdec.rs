@@ -1,62 +1,64 @@
-//! Command-line AAC Audio Decoder Tool
+//! Command-line AAC Audio Decoder Tool (`aacdec`)
+//!
+//! Decodes MPEG-4 AAC / HE-AAC bitstreams (ADTS/RAW) to uncompressed 16-bit PCM WAV.
 
+use clap::Parser;
+use hound::{WavSpec, WavWriter};
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
-use clap::Parser;
-use hound::{WavSpec, WavWriter};
+use std::time::Instant;
+use vuiocodecaac::bitstream::BitReader;
 use vuiocodecaac::prelude::*;
+use vuiocodecaac::syntax::adts::AdtsHeader;
 
 #[derive(Parser, Debug)]
-#[command(name = "aacdec", author, version, about = "High-performance MPEG AAC / USAC / DRC Audio Decoder in pure Rust", long_about = None)]
+#[command(
+    name = "aacdec",
+    author = "Vuio AAC",
+    version,
+    about = "High-performance MPEG AAC / HE-AAC / USAC Audio Decoder in pure Rust (2024)",
+    long_about = None
+)]
 struct Args {
-    /// Input AAC / ADTS / MP4 audio file path
+    /// Input AAC / ADTS audio file path
     #[arg(required = true)]
     input: PathBuf,
 
     /// Output WAV audio file path
     #[arg(required = true)]
     output: PathBuf,
-
-    /// Number of worker threads for multi-threaded decoding
-    #[arg(short, long, default_value_t = 0)]
-    threads: usize,
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    let start_time = Instant::now();
     let args = Args::parse();
 
-    println!("Decoding {:?} -> {:?}", args.input, args.output);
-
-    let mut input_file = File::open(&args.input)?;
-    let mut encoded_data = Vec::new();
-    input_file.read_to_end(&mut encoded_data)?;
+    let mut file = File::open(&args.input)?;
+    let mut bitstream = Vec::new();
+    file.read_to_end(&mut bitstream)?;
 
     let mut decoder = Decoder::new_default();
-    let mut all_pcm_samples = Vec::new();
-
-    // Parse ADTS stream frames
+    let mut all_pcm_samples: Vec<i16> = Vec::new();
     let mut offset = 0;
     let mut frame_count = 0;
 
-    while offset + 7 <= encoded_data.len() {
-        if encoded_data[offset] == 0xFF && (encoded_data[offset + 1] & 0xF0) == 0xF0 {
-            let mut reader = BitReader::new(&encoded_data[offset..]);
-            if let Ok(header) = AdtsHeader::parse(&mut reader) {
-                let frame_len = header.frame_length;
-                if offset + frame_len <= encoded_data.len() {
-                    let frame_bytes = &encoded_data[offset..offset + frame_len];
-                    match decoder.decode_frame(frame_bytes) {
-                        Ok(pcm) => {
-                            let mut interleaved = vec![0i16; pcm.total_samples()];
-                            pcm.to_interleaved(&mut interleaved);
-                            all_pcm_samples.extend_from_slice(&interleaved);
-                            frame_count += 1;
+    while offset + 7 <= bitstream.len() {
+        if bitstream[offset] == 0xFF && (bitstream[offset + 1] & 0xF0) == 0xF0 {
+            let mut reader = BitReader::new(&bitstream[offset..]);
+            if let Ok(adts) = AdtsHeader::parse(&mut reader) {
+                let frame_len = adts.frame_length as usize;
+                if offset + frame_len <= bitstream.len() {
+                    let frame_data = &bitstream[offset..offset + frame_len];
+                    if let Ok(pcm_frame) = decoder.decode_frame(frame_data) {
+                        let ch = pcm_frame.channels();
+                        let len = pcm_frame.samples_per_channel();
+                        for s in 0..len {
+                            for c in 0..ch {
+                                all_pcm_samples.push(pcm_frame.channel(c)[s]);
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("Error decoding frame {}: {:?}", frame_count, e);
-                        }
+                        frame_count += 1;
                     }
                     offset += frame_len;
                     continue;
@@ -65,8 +67,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
         offset += 1;
     }
-
-    println!("Decoded {} frames ({} total interleaved samples)", frame_count, all_pcm_samples.len());
 
     let spec = WavSpec {
         channels: decoder.channels() as u16,
@@ -81,6 +81,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
     wav_writer.finalize()?;
 
-    println!("Successfully wrote WAV to {:?}", args.output);
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let num_ch = decoder.channels().max(1) as f64;
+    let total_audio_samples = all_pcm_samples.len() as f64 / num_ch;
+    let audio_duration = total_audio_samples / decoder.sample_rate_hz().max(1) as f64;
+    let speed = audio_duration / elapsed.max(1e-6);
+
+    println!(
+        "Decoded {} frames ({:.2}s audio in {:.3}s, speed={:.1}x real-time) -> {:?}",
+        frame_count, audio_duration, elapsed, speed, args.output
+    );
     Ok(())
 }
