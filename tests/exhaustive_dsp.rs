@@ -6,15 +6,15 @@ use std::f32::consts::PI;
 #[test]
 fn test_fixed_point_basic_ops_exhaustive() {
     // Test saturation
-    assert_eq!(saturate_32(0x7FFFFFFF), 0x7FFFFFFF);
-    assert_eq!(saturate_32(0x80000000), 0x7FFFFFFF); // saturated
-    assert_eq!(saturate_32(-0x80000000), -0x80000000);
-    assert_eq!(saturate_32(-0x80000001), -0x80000000);
+    assert_eq!(sat64_32(0x7FFFFFFF), 0x7FFFFFFF);
+    assert_eq!(sat64_32(0x80000000), 0x7FFFFFFF); // saturated
+    assert_eq!(sat64_32(-0x80000000), -0x80000000);
+    assert_eq!(sat64_32(-0x80000001), -0x80000000);
 
     // Test fractional multiplication
     let a = 0x40000000; // 0.5 in Q31
     let b = 0x4000;     // 0.5 in Q15
-    let res = mult_32x16_shl_sat(a, b);
+    let res = mult32x16in32_shl_sat(a, b);
     assert_eq!(res, 0x20000000); // 0.25 in Q31
 
     // Test division
@@ -22,9 +22,8 @@ fn test_fixed_point_basic_ops_exhaustive() {
     assert_eq!(div_res, 0x40000000); // 0.5 in Q31
 
     // Test normalization
-    let (norm_val, shift) = norm32(0x00010000);
-    assert_eq!(shift, 15);
-    assert_eq!(norm_val, 0x40000000);
+    let shift = norm32(0x00010000);
+    assert_eq!(shift, 14);
 }
 
 #[test]
@@ -60,16 +59,24 @@ fn test_mdct_imdct_tdac_reconstruction() {
     let mut overlap = vec![0.0f32; frame_len];
     let mut reconstructed = vec![0.0f32; 2 * frame_len];
 
-    // Frame 0
+    // Frame 0: window and forward MDCT
+    let mut win_in0 = vec![0.0f32; 2 * frame_len];
+    for (w, (&s, &win)) in win_in0.iter_mut().zip(signal[0..2 * frame_len].iter().zip(sine_win.iter())) {
+        *w = s * win;
+    }
     let mut spec0 = vec![0.0f32; frame_len];
-    mdct.process_forward(&signal[0..2 * frame_len], &sine_win, &mut spec0);
+    mdct.forward_mdct(&win_in0, &mut spec0);
     let mut pcm0 = vec![0.0f32; frame_len];
     mdct.process_overlap_add(&spec0, &sine_win, &mut overlap, &mut pcm0);
     reconstructed[0..frame_len].copy_from_slice(&pcm0);
 
-    // Frame 1
+    // Frame 1: window and forward MDCT
+    let mut win_in1 = vec![0.0f32; 2 * frame_len];
+    for (w, (&s, &win)) in win_in1.iter_mut().zip(signal[frame_len..3 * frame_len].iter().zip(sine_win.iter())) {
+        *w = s * win;
+    }
     let mut spec1 = vec![0.0f32; frame_len];
-    mdct.process_forward(&signal[frame_len..3 * frame_len], &sine_win, &mut spec1);
+    mdct.forward_mdct(&win_in1, &mut spec1);
     let mut pcm1 = vec![0.0f32; frame_len];
     mdct.process_overlap_add(&spec1, &sine_win, &mut overlap, &mut pcm1);
     reconstructed[frame_len..2 * frame_len].copy_from_slice(&pcm1);

@@ -26,6 +26,11 @@ impl MpsDecoder {
         Self { tree_config }
     }
 
+    /// Tree configuration.
+    pub fn tree_config(&self) -> u8 {
+        self.tree_config
+    }
+
     /// Render 2-channel stereo downmix to 6-channel 5.1 surround PCM output.
     pub fn decode_5point1(
         &self,

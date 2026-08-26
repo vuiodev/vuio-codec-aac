@@ -62,10 +62,10 @@ impl DrcDecoder {
 
         for i in 0..frame_len {
             self.current_gain_linear += gain_step;
-            for ch in 0..num_ch {
-                let sample = pcm_channels[ch][i] * self.current_gain_linear;
+            for ch in pcm_channels.iter_mut().take(num_ch) {
+                let sample = ch[i] * self.current_gain_linear;
                 // Lookahead peak limiter with soft-clipping knee
-                pcm_channels[ch][i] = if sample.abs() > self.peak_limiter_threshold {
+                ch[i] = if sample.abs() > self.peak_limiter_threshold {
                     sample.signum() * (self.peak_limiter_threshold + (sample.abs() - self.peak_limiter_threshold) * 0.1)
                 } else {
                     sample

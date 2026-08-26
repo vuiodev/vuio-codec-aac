@@ -152,7 +152,7 @@ mod tests {
         let mut reader = BitReader::new(bytes);
         let parsed = AudioMuxElement::parse_loas(&mut reader).unwrap();
 
-        assert_eq!(parsed.mux_config_present, true);
+        assert!(parsed.mux_config_present);
         assert_eq!(parsed.payload_bytes.len(), 4);
     }
 }

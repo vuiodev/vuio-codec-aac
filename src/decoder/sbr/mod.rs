@@ -65,6 +65,11 @@ impl SbrDecoder {
         }
     }
 
+    /// SBR header parameters.
+    pub fn header(&self) -> &SbrHeader {
+        &self.header
+    }
+
     /// Process a baseband audio frame (1024 samples) and produce a high-frequency extended frame (2048 samples).
     pub fn process_channel(
         &mut self,

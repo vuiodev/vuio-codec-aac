@@ -46,42 +46,16 @@ impl MdctContext {
     /// Inverse MDCT: transforms $N$ spectral coefficients into $2N$ time-domain samples.
     pub fn imdct(&self, input: &[f32], output: &mut [f32]) {
         let n = self.n;
-        let n_half = n / 2;
         assert_eq!(input.len(), n, "Input must have N spectral coefficients");
         assert_eq!(output.len(), 2 * n, "Output must hold 2N time samples");
 
-        // 1. Pre-twiddle modulation into N/2 complex buffer
-        let mut fft_buf = vec![Complex32::default(); n_half];
-        for k in 0..n_half {
-            let re = -input[2 * (n_half - 1 - k) + 1];
-            let im = input[2 * k];
-            let twiddle = self.pre_twiddles[k];
-            fft_buf[k] = Complex32::new(
-                re * twiddle.re - im * twiddle.im,
-                re * twiddle.im + im * twiddle.re,
-            );
-        }
-
-        // 2. N/2 point IFFT
-        self.fft.forward(&mut fft_buf);
-
-        // 3. Post-twiddle and time-domain unfolding into 2N samples
-        let mut unfolded = vec![0.0f32; n];
-        for k in 0..n_half {
-            let twiddle = self.post_twiddles[k];
-            let c = fft_buf[k];
-            let re = c.re * twiddle.re - c.im * twiddle.im;
-            let im = c.re * twiddle.im + c.im * twiddle.re;
-            unfolded[2 * k] = im;
-            unfolded[2 * k + 1] = -re;
-        }
-
-        // 4. Construct the 2N output waveform with symmetry unfolding
-        for i in 0..n_half {
-            output[i] = -unfolded[n_half + i];
-            output[n_half + i] = -unfolded[n - 1 - i];
-            output[n + i] = unfolded[i];
-            output[n + n_half + i] = unfolded[n_half - 1 - i];
+        for (i, out) in output.iter_mut().enumerate().take(2 * n) {
+            let mut sum = 0.0f32;
+            for (k, &spec) in input.iter().enumerate().take(n) {
+                let angle = PI / (n as f32) * (i as f32 + 0.5 + (n as f32) / 2.0) * (k as f32 + 0.5);
+                sum += spec * angle.cos();
+            }
+            *out = sum;
         }
     }
 
@@ -102,6 +76,22 @@ impl MdctContext {
             let win_sample = imdct_out[i] * window[i];
             output_pcm[i] = win_sample + overlap_history[i];
             overlap_history[i] = imdct_out[n + i] * window[n + i];
+        }
+    }
+
+    /// Forward MDCT: transforms $2N$ windowed time samples into $N$ spectral coefficients.
+    pub fn forward_mdct(&self, time_in_2n: &[f32], spec_out_n: &mut [f32]) {
+        let n = self.n;
+        assert_eq!(time_in_2n.len(), 2 * n);
+        assert_eq!(spec_out_n.len(), n);
+
+        for (k, spec) in spec_out_n.iter_mut().enumerate().take(n) {
+            let mut sum = 0.0f32;
+            for (i, &t) in time_in_2n.iter().enumerate().take(2 * n) {
+                let angle = PI / (n as f32) * (i as f32 + 0.5 + (n as f32) / 2.0) * (k as f32 + 0.5);
+                sum += t * angle.cos();
+            }
+            *spec = sum * (2.0 / n as f32);
         }
     }
 }

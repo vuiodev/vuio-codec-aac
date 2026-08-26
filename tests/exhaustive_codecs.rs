@@ -2,12 +2,12 @@
 
 use xaac::decoder::aac::dequant::inverse_quantize;
 use xaac::decoder::aac::huffman::decode_spectral_band;
-use xaac::decoder::aac::pns::generate_pns_noise;
+use xaac::decoder::aac::pns::PnsGenerator;
 use xaac::decoder::aac::stereo::{apply_intensity_stereo, apply_ms_stereo};
-use xaac::decoder::aac::tns::{apply_tns_lattice_filter, TnsFilterInfo};
-use xaac::decoder::drc::{DrcDecoder, DrcFrameData};
+use xaac::decoder::aac::tns::TnsFilter;
+use xaac::decoder::drc::DrcDecoder;
 use xaac::decoder::mps::{MpsDecoder, MpsSpatialCues};
-use xaac::decoder::ps::{PsDecoder, PsFrameData};
+use xaac::decoder::ps::PsDecoder;
 use xaac::decoder::sbr::{SbrDecoder, SbrHeader};
 use xaac::decoder::usac::{UsacCoreMode, UsacDecoder};
 use xaac::encoder::aac::block_switch::BlockSwitching;
@@ -50,22 +50,26 @@ fn test_stereo_pns_and_tns_tools() {
     // Intensity Stereo
     let left_src = [2.0f32, 4.0];
     let mut right_dest = [0.0f32, 0.0];
-    apply_intensity_stereo(&left_src, 100, 96, false, &mut right_dest);
+    apply_intensity_stereo(&left_src, 100, false, &mut right_dest);
     assert_ne!(right_dest[0], 0.0);
 
     // PNS
+    let mut pns = PnsGenerator::default();
     let mut pns_spec = [0.0f32; 16];
-    generate_pns_noise(100, 12345, &mut pns_spec);
+    pns.fill_noise_band(100, &mut pns_spec);
     assert_ne!(pns_spec[0], 0.0);
 
     // TNS
     let mut tns_spec = [1.0f32, 0.5, -0.5, 0.2];
-    let tns_filter = TnsFilterInfo {
+    let tns_filter = TnsFilter {
+        start_band: 0,
+        stop_band: 4,
         order: 2,
         direction: false,
+        coef_res: true,
         coefficients: vec![0.5, -0.25],
     };
-    apply_tns_lattice_filter(&mut tns_spec, &tns_filter);
+    tns_filter.apply(&mut tns_spec);
     assert_eq!(tns_spec.len(), 4);
 }
 

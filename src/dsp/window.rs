@@ -39,10 +39,10 @@ pub fn generate_kbd_window_f32(length: usize, alpha: f32) -> Vec<f32> {
     let denom = bessel_i0(beta);
 
     let mut kaiser = vec![0.0f32; half + 1];
-    for n in 0..=half {
+    for (n, k_elem) in kaiser.iter_mut().enumerate().take(half + 1) {
         let x = 2.0 * n as f32 / half as f32 - 1.0;
         let arg = (1.0 - x * x).max(0.0).sqrt();
-        kaiser[n] = bessel_i0(beta * arg) / denom;
+        *k_elem = bessel_i0(beta * arg) / denom;
     }
 
     let mut cumulative = vec![0.0f32; half + 1];

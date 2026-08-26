@@ -44,7 +44,7 @@ impl UsacDecoder {
 
         // 1. Adaptive codebook (pitch excitation)
         for i in 0..len {
-            let hist_idx = if i >= pitch_lag { i - pitch_lag } else { 0 };
+            let hist_idx = i.saturating_sub(pitch_lag);
             excitation[i] += pitch_gain * excitation[hist_idx];
         }
 

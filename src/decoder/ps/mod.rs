@@ -64,8 +64,9 @@ impl PsDecoder {
 
         for i in 0..count {
             let s = mono_input[i];
-            // All-pass fractional delay decorrelation
-            let d_delayed = if i >= 14 { mono_input[i - 14] } else { 0.0 };
+            // All-pass fractional delay decorrelation with delay state
+            let d_delayed = self.hybrid_delay_line[i % 128];
+            self.hybrid_delay_line[i % 128] = s;
             let decorrelated = d_delayed * beta * 0.5;
 
             left_out[i] = c1 * s + decorrelated;

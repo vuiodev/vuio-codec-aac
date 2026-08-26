@@ -54,6 +54,10 @@ fn test_asc_and_pce_syntax() {
         sampling_rate: SamplingRate::Hz44100,
         channel_config: ChannelConfiguration::Stereo,
         frame_length: FrameLength::Samples1024,
+        depends_on_core_coder: false,
+        core_coder_delay: 0,
+        extension_audio_object_type: None,
+        extension_sampling_rate: None,
         sbr_present: false,
         ps_present: false,
     };
@@ -105,6 +109,10 @@ fn test_adif_and_latm_syntax() {
         sampling_rate: SamplingRate::Hz32000,
         channel_config: ChannelConfiguration::Mono,
         frame_length: FrameLength::Samples1024,
+        depends_on_core_coder: false,
+        core_coder_delay: 0,
+        extension_audio_object_type: None,
+        extension_sampling_rate: None,
         sbr_present: false,
         ps_present: false,
     };
