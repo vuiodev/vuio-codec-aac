@@ -99,22 +99,42 @@ fn test_mdct_imdct_tdac_reconstruction() {
     }
 }
 
+/// The filterbank pair must reconstruct a tone, doubled in rate and delayed by the
+/// bank's 576 and a half samples, to better than a per-cent.
 #[test]
 fn test_qmf_analysis_synthesis_reconstruction() {
-    let mut qmf_anal = QmfAnalysis32::new();
-    let mut qmf_syn = QmfSynthesis64::new();
+    use vuiocodecaac::dsp::fft::Complex32;
 
-    let input_chunk = [0.25f32; 32];
-    let mut anal_out = [0.0f32; 32];
-    qmf_anal.analyze(&input_chunk, &mut anal_out);
+    let mut qmf_anal = QmfAnalysis::new();
+    let mut qmf_syn = QmfSynthesis::new(SynthesisWidth::Full);
 
-    let mut syn_in = [0.0f32; 64];
-    syn_in[..32].copy_from_slice(&anal_out);
+    let slots = 160;
+    let input: Vec<f32> = (0..slots * 32).map(|i| 0.6 * ((i as f32) * 0.19).sin()).collect();
+    let mut output = vec![0.0f32; slots * 64];
+    let mut low = [Complex32::default(); 32];
+    let mut wide = [Complex32::default(); 64];
 
-    let mut syn_out = [0.0f32; 64];
-    qmf_syn.synthesize(&syn_in, &mut syn_out);
+    for slot in 0..slots {
+        qmf_anal.process_slot(&input[slot * 32..slot * 32 + 32], &mut low);
+        wide[..32].copy_from_slice(&low);
+        wide[32..].fill(Complex32::default());
+        qmf_syn.process_slot(&wide, &mut output[slot * 64..slot * 64 + 64]);
+    }
 
-    assert_eq!(syn_out.len(), 64);
+    // The chain's delay falls between two output samples, so the reference is the
+    // continuous tone evaluated there rather than a shifted copy of the input.
+    let delay = 576.5f64;
+    let w = 0.19f64 / 2.0;
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for j in 2000..output.len() - 2000 {
+        let want = 0.6 * (w * (j as f64 - delay)).sin();
+        let got = output[j] as f64;
+        num += (got - want) * (got - want);
+        den += want * want;
+    }
+    let snr = 10.0 * (den / num).log10();
+    assert!(snr > 45.0, "QMF round trip reconstructs at only {snr:.1} dB");
 }
 
 #[test]

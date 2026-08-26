@@ -10,7 +10,7 @@ use vuiocodecaac::tables::scalefactor::{MAX_SFB_LONG, compute_sfb_offsets};
 use vuiocodecaac::decoder::drc::DrcDecoder;
 use vuiocodecaac::decoder::mps::{MpsDecoder, MpsSpatialCues};
 use vuiocodecaac::decoder::ps::PsDecoder;
-use vuiocodecaac::decoder::sbr::{SbrDecoder, SbrHeader};
+use vuiocodecaac::decoder::sbr::{SBR_CORE_FRAME, SbrDecoder};
 use vuiocodecaac::decoder::usac::{UsacCoreMode, UsacDecoder};
 use vuiocodecaac::encoder::aac::block_switch::BlockSwitching;
 use vuiocodecaac::encoder::aac::psycho::PsychoacousticModel;
@@ -104,16 +104,18 @@ fn test_stereo_pns_and_tns_tools() {
 
 #[test]
 fn test_sbr_and_ps_end_to_end() {
-    let mut sbr = SbrDecoder::new(SbrHeader::default());
+    let mut sbr = SbrDecoder::new(1, 22050, false);
     let mut sbr_enc = SbrEncoder::new(44100, 128000);
 
-    let baseband = vec![0.5f32; 1024];
+    let baseband: Vec<f32> = (0..SBR_CORE_FRAME)
+        .map(|i| 0.5 * ((i as f32) * 0.05).sin())
+        .collect();
     let payload = sbr_enc.encode_sbr_frame(&baseband).unwrap();
     assert!(!payload.is_empty());
 
-    let mut output_2x = vec![0.0f32; 2048];
-    sbr.process_channel(&baseband, &mut output_2x).unwrap();
-    assert_eq!(output_2x.len(), 2048);
+    let mut output_2x = vec![0.0f32; sbr.output_frame_len()];
+    sbr.process_channel(0, &baseband, &mut output_2x).unwrap();
+    assert_eq!(output_2x.len(), 2 * SBR_CORE_FRAME);
 
     let ps_enc = PsEncoder::new();
     let mut ps_dec = PsDecoder::new();

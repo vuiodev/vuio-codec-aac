@@ -43,6 +43,15 @@ const ANALYSIS_HISTORY: usize = 320;
 /// Samples of history the synthesis bank windows.
 const SYNTHESIS_HISTORY: usize = 1280;
 
+/// Gain the 32-band analysis applies on top of the prototype's own normalisation.
+///
+/// The bank has to agree, sample for sample, with the 64-band analysis a *encoder*
+/// runs at twice the rate — that is what makes a transmitted SBR envelope energy
+/// comparable with an energy the decoder measures. Two banks of the same prototype
+/// at a factor-of-two rate ratio differ by exactly this factor in amplitude, so it
+/// is applied here rather than left for every caller to remember.
+const ANALYSIS_SCALE: f32 = 2.0;
+
 /// 32-band complex analysis filterbank.
 ///
 /// Feeds one time slot at a time: 32 real input samples in, 32 complex subbands out.
@@ -79,7 +88,8 @@ impl QmfAnalysis {
         let mut post = Box::new([Complex32::default(); QMF_ANALYSIS_BANDS]);
         for (k, p) in post.iter_mut().enumerate() {
             let a = -31.0 * std::f64::consts::PI * (k as f64 + 0.5) / 64.0;
-            *p = Complex32::new(a.cos() as f32, a.sin() as f32);
+            let g = ANALYSIS_SCALE;
+            *p = Complex32::new(g * a.cos() as f32, g * a.sin() as f32);
         }
         Self {
             history: Box::new([0.0; 2 * ANALYSIS_HISTORY]),
@@ -202,10 +212,10 @@ pub struct QmfSynthesis {
 
 /// Round-trip gain of an analysis bank feeding a synthesis bank of either width.
 ///
-/// The prototype is normalised so the two banks together multiply by `2^5`; the
-/// synthesis divides it back out so a decoder can hand the filterbank a signal and
-/// get the same signal back.
-const QMF_ROUND_TRIP_GAIN: f32 = 32.0;
+/// The prototype's own normalisation multiplies by `2^5` across the pair, and
+/// [`ANALYSIS_SCALE`] doubles that again; the synthesis divides the product back
+/// out, so a decoder can hand the filterbank a signal and get the same signal back.
+const QMF_ROUND_TRIP_GAIN: f32 = 64.0;
 
 impl QmfSynthesis {
     /// Build a synthesis bank of the given width, with a cleared delay line.
@@ -219,16 +229,7 @@ impl QmfSynthesis {
         let n = two_bands as f64;
         let pre = (0..bands)
             .map(|k| {
-                // A 32-band analysis feeding a 64-band synthesis leaves the two
-                // banks' modulation references half an output sample apart. Taking
-                // that half sample out here makes the doubling chain's delay the
-                // round number 577 rather than 576.5, so the low bands land on
-                // integer sample positions.
-                let extra = match width {
-                    SynthesisWidth::Full => -std::f64::consts::PI * (k as f64 + 0.5) / n,
-                    SynthesisWidth::Downsampled => 0.0,
-                };
-                let a = std::f64::consts::PI * (bands - 1) as f64 * k as f64 / n + extra;
+                let a = std::f64::consts::PI * (bands - 1) as f64 * k as f64 / n;
                 Complex32::new(a.cos() as f32, a.sin() as f32)
             })
             .collect();
@@ -304,7 +305,7 @@ impl QmfSynthesis {
         let acc = &mut acc[..bands];
         for e in 0..10 {
             let block = &v[e * two_bands..(e + 1) * two_bands];
-            let half = if e % 2 == 0 { &block[bands..] } else { &block[..bands] };
+            let half = if e.is_multiple_of(2) { &block[bands..] } else { &block[..bands] };
             let c = &proto[(9 - e) * bands..(9 - e) * bands + bands];
             for i in 0..bands {
                 acc[i] += half[i] * c[i];
@@ -357,9 +358,9 @@ mod tests {
         let (lo, hi) = (2000, output.len() - 2000);
         let mut num = 0.0f64;
         let mut den = 0.0f64;
-        for j in lo..hi {
+        for (j, &sample) in output.iter().enumerate().take(hi).skip(lo) {
             let want = (w * (j as f64 - delay)).sin();
-            let got = output[j] as f64;
+            let got = sample as f64;
             num += (got - want) * (got - want);
             den += want * want;
         }
@@ -376,7 +377,10 @@ mod tests {
     #[test]
     fn doubling_chain_is_transparent() {
         for band in [0.0f32, 0.5, 3.0, 8.5, 16.0, 23.5, 30.0] {
-            let snr = tone_snr(band, SynthesisWidth::Full, 577.0);
+            // A 32-band analysis feeding a 64-band synthesis leaves the two banks'
+            // modulation references half an output sample apart, so the chain's
+            // delay lands between two output samples.
+            let snr = tone_snr(band, SynthesisWidth::Full, 576.5);
             assert!(snr > 50.0, "band {band} reconstructs at only {snr:.1} dB");
         }
     }

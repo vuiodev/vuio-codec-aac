@@ -20,6 +20,7 @@ use crate::decoder::aac::dequant::inverse_quantize_channel;
 use crate::decoder::aac::pns::{NoiseMode, NoiseRng, apply_pns};
 use crate::decoder::aac::stereo::{MsMask, apply_intensity_stereo, apply_ms_stereo};
 use crate::decoder::aac::tns::apply_tns;
+use crate::decoder::sbr::{SBR_CORE_FRAME, SbrDecoder, SbrElement};
 use crate::dsp::filterbank::Filterbank;
 use crate::error::{DecodeError, Result};
 use crate::syntax::adts::AdtsHeader;
@@ -30,6 +31,29 @@ use crate::types::{
 
 /// Largest number of channels a single raw data block may produce.
 pub const MAX_CHANNELS: usize = 8;
+
+/// Extension payload identifiers that may appear in a fill element.
+mod extension {
+    /// Dynamic range control metadata.
+    #[allow(dead_code)]
+    pub const DYNAMIC_RANGE: u8 = 11;
+    /// Spectral band replication payload.
+    pub const SBR_DATA: u8 = 13;
+    /// The same, preceded by a CRC over it.
+    pub const SBR_DATA_CRC: u8 = 14;
+}
+
+/// Where an SBR payload found in a fill element applies.
+///
+/// SBR data rides in a fill element that follows the channel element it describes,
+/// so parsing has to remember what came just before.
+#[derive(Debug, Clone, Copy)]
+struct SbrTarget {
+    /// Index of the channel element among the frame's channel elements.
+    element: usize,
+    /// Whether that element carries one channel or two.
+    kind: SbrElement,
+}
 
 /// MPEG-4 audio syntactic element identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +101,8 @@ struct ChannelState {
     prev_shape: WindowShape,
     /// Time-domain output for this frame.
     pcm: Vec<f32>,
+    /// Band-replicated output, at twice the core rate.
+    sbr_pcm: Vec<f32>,
 }
 
 impl ChannelState {
@@ -86,6 +112,7 @@ impl ChannelState {
             overlap: vec![0.0; frame_len],
             prev_shape: WindowShape::Sine,
             pcm: vec![0.0; frame_len],
+            sbr_pcm: Vec::new(),
         }
     }
 }
@@ -105,6 +132,16 @@ pub struct Decoder {
     noise_rng: NoiseRng,
     /// Channels the last decoded frame actually produced.
     active_channels: usize,
+    /// One band replicator per channel element, created when the first payload for
+    /// that element arrives.
+    sbr: Vec<SbrDecoder>,
+    /// Set once any element has carried an SBR payload; from then on the decoder
+    /// runs the replication chain every frame, so its delay stays constant.
+    sbr_active: bool,
+    /// Which channels each channel element of the last frame produced.
+    elements: Vec<(usize, usize)>,
+    /// Holds a channel's core frame while the replicator writes its output.
+    sbr_scratch: Vec<f32>,
 }
 
 impl Decoder {
@@ -124,6 +161,10 @@ impl Decoder {
             noise_mode: NoiseMode::default(),
             noise_rng: NoiseRng::default(),
             active_channels: declared,
+            sbr: Vec::new(),
+            sbr_active: false,
+            elements: Vec::new(),
+            sbr_scratch: Vec::new(),
         }
     }
 
@@ -149,13 +190,28 @@ impl Decoder {
     }
 
     /// Output sampling rate in Hz.
+    ///
+    /// Band replication doubles it, so a stream whose headers say 22.05 kHz decodes
+    /// to 44.1 kHz once its first SBR payload has been seen.
     pub fn sample_rate_hz(&self) -> u32 {
+        let core = self.config.sampling_rate.hz();
+        if self.sbr_active { core * 2 } else { core }
+    }
+
+    /// Sampling rate of the AAC core, before any band replication.
+    pub fn core_sample_rate_hz(&self) -> u32 {
         self.config.sampling_rate.hz()
     }
 
-    /// Samples per channel per frame.
+    /// Samples per channel per frame, at the output rate.
     pub fn frame_length(&self) -> usize {
-        self.config.frame_length.samples()
+        let core = self.config.frame_length.samples();
+        if self.sbr_active { core * 2 } else { core }
+    }
+
+    /// Whether the stream has been found to carry band replication.
+    pub fn sbr_active(&self) -> bool {
+        self.sbr_active
     }
 
     /// Frames decoded so far.
@@ -184,6 +240,9 @@ impl Decoder {
         }
         self.noise_rng = NoiseRng::default();
         self.frame_count = 0;
+        for sbr in &mut self.sbr {
+            sbr.reset();
+        }
     }
 
     /// Generator to use for `channel` of the frame being decoded.
@@ -222,13 +281,21 @@ impl Decoder {
         let produced = self.decode_raw_data_block(&mut reader)?;
         self.active_channels = produced.max(1);
 
-        if self.output_pcm.channels() != self.active_channels {
-            self.output_pcm.resize(self.active_channels, self.frame_length());
+        if self.sbr_active {
+            self.apply_band_replication()?;
+        }
+
+        let frame_len = self.frame_length();
+        if self.output_pcm.channels() != self.active_channels
+            || self.output_pcm.samples_per_channel() != frame_len
+        {
+            self.output_pcm.resize(self.active_channels, frame_len);
         }
 
         // Convert to interleaved 16-bit PCM with saturation.
         for ch in 0..self.active_channels {
-            let src = &self.channels[ch].pcm;
+            let src: &[f32] =
+                if self.sbr_active { &self.channels[ch].sbr_pcm } else { &self.channels[ch].pcm };
             let dst = self.output_pcm.channel_mut(ch);
             for (out, &v) in dst.iter_mut().zip(src.iter()) {
                 *out = clamp_to_i16(v);
@@ -258,6 +325,8 @@ impl Decoder {
         let frame_length = self.config.frame_length;
         let aot = self.config.audio_object_type;
         let mut next_channel = 0usize;
+        let mut sbr_target: Option<SbrTarget> = None;
+        self.elements.clear();
 
         while reader.bits_remaining() >= 3 {
             let Some(element) = ElementType::from_u8(reader.read_u8(3)?) else {
@@ -269,6 +338,11 @@ impl Decoder {
                     if next_channel >= MAX_CHANNELS {
                         break;
                     }
+                    if element == ElementType::Sce {
+                        sbr_target =
+                            Some(SbrTarget { element: self.elements.len(), kind: SbrElement::Single });
+                    }
+                    self.elements.push((next_channel, 1));
                     let _tag = reader.read_u8(4)?;
                     let mut rng = self.take_noise_rng(next_channel);
                     let ch = &mut self.channels[next_channel];
@@ -283,6 +357,9 @@ impl Decoder {
                     if next_channel + 1 >= MAX_CHANNELS {
                         break;
                     }
+                    sbr_target =
+                        Some(SbrTarget { element: self.elements.len(), kind: SbrElement::Pair });
+                    self.elements.push((next_channel, 2));
                     let _tag = reader.read_u8(4)?;
                     let common_window = reader.read_bit()?;
 
@@ -349,7 +426,7 @@ impl Decoder {
                     // consume it and keep the existing configuration.
                     crate::syntax::pce::ProgramConfigElement::parse(reader)?;
                 }
-                ElementType::Fil => skip_fill_element(reader)?,
+                ElementType::Fil => self.parse_fill_element(reader, sbr_target)?,
                 ElementType::End => break,
             }
         }
@@ -363,6 +440,136 @@ impl Decoder {
 
         self.synthesize(next_channel);
         Ok(next_channel)
+    }
+
+    /// Consume a `fill_element()`, handing any SBR payload to the replicator that
+    /// owns the channel element it follows.
+    ///
+    /// Whatever the payload turns out to be, the reader is left exactly at the end
+    /// of the declared byte count: a payload this decoder does not understand, or
+    /// one that fails to parse, must not desynchronise the rest of the frame.
+    fn parse_fill_element(
+        &mut self,
+        reader: &mut BitReader,
+        target: Option<SbrTarget>,
+    ) -> Result<()> {
+        let mut count = reader.read_u8(4)? as usize;
+        if count == 15 {
+            count += reader.read_u8(8)? as usize;
+            count -= 1;
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let payload_bits = count * 8;
+        if reader.bits_remaining() < payload_bits {
+            return Err(DecodeError::CorruptedFrame("fill element runs past the frame".into()).into());
+        }
+        let start = reader.bit_position();
+
+        let kind = reader.read_u8(4)?;
+        if matches!(kind, extension::SBR_DATA | extension::SBR_DATA_CRC)
+            && let Some(target) = target
+        {
+            let with_crc = kind == extension::SBR_DATA_CRC;
+            self.decode_sbr_payload(reader, target, with_crc);
+        }
+
+        let consumed = reader.bit_position() - start;
+        if consumed < payload_bits {
+            reader.skip_bits(payload_bits - consumed)?;
+        }
+        Ok(())
+    }
+
+    /// Hand one SBR payload to the right replicator, creating it if this is the
+    /// first payload that element has carried.
+    ///
+    /// A payload that fails to parse is dropped rather than propagated: the core
+    /// signal is still perfectly good, and the alternative is discarding a frame
+    /// over metadata the ear would barely notice.
+    fn decode_sbr_payload(&mut self, reader: &mut BitReader, target: SbrTarget, with_crc: bool) {
+        if self.config.frame_length.samples() != SBR_CORE_FRAME {
+            return;
+        }
+        let core_rate = self.config.sampling_rate.hz();
+        while self.sbr.len() <= target.element {
+            self.sbr.push(SbrDecoder::new(target.kind.channels(), core_rate, false));
+        }
+        let sbr = &mut self.sbr[target.element];
+        sbr.set_core_rate(core_rate);
+        match sbr.decode_extension(reader, target.kind, with_crc) {
+            Ok(()) => self.sbr_active = true,
+            Err(e) => {
+                if std::env::var_os("AAC_TRACE_SBR").is_some() {
+                    eprintln!("sbr payload rejected: {e}");
+                }
+            }
+        }
+    }
+
+    /// Run the replication chain for every channel of every element that has one.
+    ///
+    /// Elements with no replicator still have their sample rate doubled, or the
+    /// frame would mix channels running at two different rates.
+    fn apply_band_replication(&mut self) -> Result<()> {
+        let core_len = self.config.frame_length.samples();
+        let out_len = core_len * 2;
+
+        for ch in self.channels.iter_mut().take(self.active_channels) {
+            if ch.sbr_pcm.len() != out_len {
+                ch.sbr_pcm = vec![0.0; out_len];
+            }
+        }
+
+        // Every element gets a replicator once any element has one, so that all
+        // channels take the same filterbank path and share the same delay. A
+        // replicator with no payload simply resamples.
+        let core_rate = self.config.sampling_rate.hz();
+        for &(_, count) in &self.elements {
+            if self.sbr.len() < self.elements.len() {
+                self.sbr.push(SbrDecoder::new(count, core_rate, false));
+            }
+        }
+
+        // The core frame and the replicated frame both live in `channels`, so the
+        // core is moved into a scratch buffer for the call and moved back after.
+        let elements = std::mem::take(&mut self.elements);
+        let mut result = Ok(());
+        for (index, &(first, count)) in elements.iter().enumerate() {
+            for offset in 0..count {
+                let channel = first + offset;
+                if channel >= self.active_channels {
+                    continue;
+                }
+                std::mem::swap(&mut self.sbr_scratch, &mut self.channels[channel].pcm);
+                let mut produced = std::mem::take(&mut self.channels[channel].sbr_pcm);
+
+                match self.sbr.get_mut(index) {
+                    Some(sbr) => {
+                        if let Err(e) = sbr.process_channel(offset, &self.sbr_scratch, &mut produced)
+                            && result.is_ok()
+                        {
+                            result = Err(e);
+                        }
+                    }
+                    None => {
+                        // No replicator at all: hold each sample for two output
+                        // samples. Only reachable for a frame whose element count
+                        // grew mid-stream.
+                        for (i, &v) in self.sbr_scratch.iter().enumerate() {
+                            produced[2 * i] = v;
+                            produced[2 * i + 1] = v;
+                        }
+                    }
+                }
+
+                self.channels[channel].sbr_pcm = produced;
+                std::mem::swap(&mut self.sbr_scratch, &mut self.channels[channel].pcm);
+            }
+        }
+        self.elements = elements;
+        result
     }
 
     /// Run deinterleaving, TNS and the filterbank for every decoded channel.
@@ -475,19 +682,6 @@ fn skip_data_stream_element(reader: &mut BitReader) -> Result<()> {
     }
     if align {
         reader.byte_align();
-    }
-    reader.skip_bits(count * 8)?;
-    Ok(())
-}
-
-/// Consume a `fill_element()`.
-///
-/// Fill elements carry SBR payloads and DRC metadata, neither of which this decoder
-/// applies yet; the payload still has to be stepped over exactly.
-fn skip_fill_element(reader: &mut BitReader) -> Result<()> {
-    let mut count = reader.read_u8(4)? as usize;
-    if count == 15 {
-        count += reader.read_u8(8)? as usize - 1;
     }
     reader.skip_bits(count * 8)?;
     Ok(())

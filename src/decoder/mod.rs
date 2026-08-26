@@ -21,5 +21,6 @@ pub use drc::{DrcDecoder, DrcFrameData};
 pub use engine::Decoder;
 pub use mps::{MpsDecoder, MpsSpatialCues};
 pub use ps::{PsDecoder, PsFrameData};
-pub use sbr::{SbrDecoder, SbrHeader};
+pub use sbr::header::SbrHeader;
+pub use sbr::{SbrDecoder, SbrElement};
 pub use usac::{UsacCoreMode, UsacDecoder};

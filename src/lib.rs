@@ -11,12 +11,12 @@
 //! data, framed in ADTS. It is verified against the C reference; see the README
 //! for the measured figures.
 //!
-//! Spectral Band Replication (HE-AAC), Parametric Stereo, MPEG Surround, USAC and
-//! DRC are **not implemented**. An HE-AAC stream decodes to its AAC-LC core at
-//! half the nominal sample rate, because the SBR payload travels in fill elements
-//! the decoder steps over. The encoder emits conformant AAC-LC but has no
-//! psychoacoustic model, so its quality at a given bitrate is well below a mature
-//! encoder's.
+//! Spectral Band Replication is implemented: an HE-AAC stream decodes at its full
+//! nominal sample rate, with the replicated range reconstructed from the transmitted
+//! envelopes, noise floors and added sinusoids. Parametric Stereo, MPEG Surround,
+//! USAC and DRC are **not** implemented. The encoder emits conformant AAC-LC but
+//! has no psychoacoustic model, so its quality at a given bitrate is well below a
+//! mature encoder's.
 //!
 //! ## Quickstart: Decoding an AAC Stream
 //!
