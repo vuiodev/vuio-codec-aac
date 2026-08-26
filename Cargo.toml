@@ -34,20 +34,20 @@ thiserror = "2.0"
 
 # High-performance memory and alignment for SIMD / Cache-line alignment (64-byte aligned)
 aligned-vec = "0.6"
-bytes = "1.7"
+bytes = "1.12"
 byteorder = "1.5"
 
 # Bitflags for syntax headers & channel configurations
-bitflags = "2.6"
+bitflags = "2.13"
 
 # Multithreaded parallel DSP processing (multi-channel, batch chunking, psychoacoustics)
-rayon = { version = "1.10", optional = true }
+rayon = { version = "1.12", optional = true }
 
 # Structured diagnostics & profiling
 tracing = { version = "0.1", default-features = false }
 
 # CLI dependencies (only built for bin targets)
-clap = { version = "4.5", features = ["derive", "cargo", "wrap_help"], optional = true }
+clap = { version = "4.6", features = ["derive", "cargo", "wrap_help"], optional = true }
 hound = { version = "3.5", optional = true }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], optional = true }
 
@@ -84,9 +84,9 @@ required-features = ["cli", "encoder"]
 
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 hound = "3.5"
-tempfile = "3.12"
+tempfile = "3.27"
 
 [[bench]]
 name = "codec_bench"
