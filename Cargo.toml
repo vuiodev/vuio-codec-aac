@@ -1,0 +1,96 @@
+[package]
+name = "xaac"
+version = "0.1.0"
+edition = "2024"
+authors = ["Antigravity & Contributors"]
+license = "Apache-2.0"
+description = "High-performance, bit-exact, pure Rust 2024 implementation of the MPEG AAC, HE-AAC v1/v2, AAC-ELD, USAC, and DRC audio codec family."
+readme = "README.md"
+repository = "https://github.com/alex/xaac"
+keywords = ["audio", "aac", "codec", "dsp", "usac"]
+categories = ["multimedia::audio", "encoding", "algorithms"]
+
+[features]
+default = ["decoder", "encoder", "sbr", "ps", "simd", "rayon", "std", "clap", "hound", "tracing-subscriber"]
+std = []
+decoder = []
+encoder = []
+sbr = []
+ps = []
+mps = []
+usac = []
+drc = []
+simd = []
+rayon = ["dep:rayon"]
+clap = ["dep:clap"]
+hound = ["dep:hound"]
+tracing-subscriber = ["dep:tracing-subscriber"]
+
+
+[dependencies]
+# Error handling
+thiserror = "2.0"
+
+# High-performance memory and alignment for SIMD / Cache-line alignment (64-byte aligned)
+aligned-vec = "0.6"
+bytes = "1.7"
+byteorder = "1.5"
+
+# Bitflags for syntax headers & channel configurations
+bitflags = "2.6"
+
+# Multithreaded parallel DSP processing (multi-channel, batch chunking, psychoacoustics)
+rayon = { version = "1.10", optional = true }
+
+# Structured diagnostics & profiling
+tracing = { version = "0.1", default-features = false }
+
+# CLI dependencies (only built for bin targets)
+clap = { version = "4.5", features = ["derive", "cargo", "wrap_help"], optional = true }
+hound = { version = "3.5", optional = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], optional = true }
+
+[[bin]]
+name = "aacdec"
+path = "src/bin/aacdec.rs"
+required-features = ["decoder", "clap", "hound", "tracing-subscriber"]
+
+[[bin]]
+name = "aacenc"
+path = "src/bin/aacenc.rs"
+required-features = ["encoder", "clap", "hound", "tracing-subscriber"]
+
+[[bin]]
+name = "verify_audio"
+path = "src/bin/verify_audio.rs"
+required-features = ["hound"]
+
+[[bin]]
+name = "test_all_modes"
+path = "src/bin/test_all_modes.rs"
+required-features = ["hound", "encoder", "decoder"]
+
+
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+hound = "3.5"
+tempfile = "3.12"
+
+[[bench]]
+name = "codec_bench"
+harness = false
+
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+debug = false
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
