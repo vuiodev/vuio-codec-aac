@@ -2,8 +2,8 @@
 name = "xaac"
 version = "0.1.0"
 edition = "2024"
-authors = ["Antigravity & Contributors"]
-license = "Apache-2.0"
+authors = ["vyrti & Contributors"]
+license = "Apache-2.0 or MIT"
 description = "High-performance, bit-exact, pure Rust 2024 implementation of the MPEG AAC, HE-AAC v1/v2, AAC-ELD, USAC, and DRC audio codec family."
 readme = "README.md"
 repository = "https://github.com/alex/xaac"

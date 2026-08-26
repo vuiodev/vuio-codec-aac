@@ -66,6 +66,15 @@ impl QmfAnalysis32 {
             *out = Complex32::new(re, im);
         }
     }
+    /// Process 32 time-domain input samples into 32 real subband outputs.
+    pub fn analyze(&mut self, input_32: &[f32], output_real_32: &mut [f32]) {
+        assert_eq!(output_real_32.len(), 32);
+        let mut complex_out = [Complex32::default(); 32];
+        self.process_timeslot(input_32, &mut complex_out);
+        for (out, c) in output_real_32.iter_mut().zip(complex_out.iter()) {
+            *out = c.re;
+        }
+    }
 }
 
 /// 64-subband Synthesis QMF Filterbank.
@@ -126,5 +135,16 @@ impl QmfSynthesis64 {
             }
             *out = sum;
         }
+    }
+
+    /// Synthesize 64 real subband inputs into 64 time-domain output samples.
+    pub fn synthesize(&mut self, real_subbands: &[f32], output_64: &mut [f32]) {
+        assert_eq!(real_subbands.len(), 64);
+        let mut complex_in = [Complex32::default(); 64];
+        for (c, &r) in complex_in.iter_mut().zip(real_subbands.iter()) {
+            c.re = r;
+            c.im = 0.0;
+        }
+        self.process_timeslot(&complex_in, output_64);
     }
 }

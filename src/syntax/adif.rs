@@ -4,7 +4,7 @@
 //! copyright identification, bitstream type, and Program Config Elements (PCE).
 
 use crate::bitstream::{BitReader, BitWriter};
-use crate::error::{Result, SyntaxError};
+use crate::error::{FormatError, Result};
 use crate::syntax::asc::AudioSpecificConfig;
 
 /// ADIF Header Structure.
@@ -29,7 +29,7 @@ impl AdifHeader {
     pub fn parse(reader: &mut BitReader) -> Result<Self> {
         let sync = reader.read_u32(32)?;
         if sync != Self::SYNCWORD {
-            return Err(SyntaxError::InvalidSyncword { syncword: sync }.into());
+            return Err(FormatError::InvalidAdif(format!("Invalid syncword: {:#010x}", sync)).into());
         }
 
         let copyright_id_present = reader.read_bit()?;
@@ -108,6 +108,10 @@ mod tests {
             sampling_rate: SamplingRate::Hz44100,
             channel_config: ChannelConfiguration::Stereo,
             frame_length: crate::types::FrameLength::Samples1024,
+            depends_on_core_coder: false,
+            core_coder_delay: 0,
+            extension_audio_object_type: None,
+            extension_sampling_rate: None,
             sbr_present: false,
             ps_present: false,
         };

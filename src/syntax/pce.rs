@@ -118,7 +118,7 @@ impl ProgramConfigElement {
         writer.write_u8(self.element_instance_tag & 0x0F, 4);
         let aot_val = (self.object_type.as_u8().saturating_sub(1)) & 0x03;
         writer.write_u8(aot_val, 2);
-        writer.write_u8(self.sampling_rate.index() & 0x0F, 4);
+        writer.write_u8(self.sampling_rate.to_index().unwrap_or(4) & 0x0F, 4);
 
         writer.write_u8(self.num_front_channel_elements & 0x0F, 4);
         writer.write_u8(self.num_side_channel_elements & 0x0F, 4);

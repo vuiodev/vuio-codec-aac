@@ -9,10 +9,7 @@ use crate::error::{DspError, Result};
 /// Levinson-Durbin recursion to compute LPC filter coefficients from autocorrelation.
 pub fn levinson_durbin(autocorr: &[f32], order: usize, lpc_out: &mut [f32], rc_out: &mut [f32]) -> Result<f32> {
     if autocorr.len() <= order || lpc_out.len() <= order || rc_out.len() < order {
-        return Err(DspError::InvalidTransformSize {
-            size: order,
-            expected: autocorr.len(),
-        }.into());
+        return Err(DspError::InvalidTransformLength(order).into());
     }
 
     let mut error = autocorr[0];

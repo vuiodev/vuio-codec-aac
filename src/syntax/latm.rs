@@ -4,7 +4,7 @@
 //! (ISO/IEC 14496-3 Part 3 Subpart 1) for broadcast and streaming audio.
 
 use crate::bitstream::{BitReader, BitWriter};
-use crate::error::{Result, SyntaxError};
+use crate::error::{FormatError, Result};
 use crate::syntax::asc::AudioSpecificConfig;
 
 /// LOAS / LATM Audio Multiplex Element.
@@ -34,7 +34,7 @@ impl AudioMuxElement {
     pub fn parse_loas(reader: &mut BitReader) -> Result<Self> {
         let sync = reader.read_u16(11)?;
         if sync != Self::LOAS_SYNCWORD {
-            return Err(SyntaxError::InvalidSyncword { syncword: sync as u32 }.into());
+            return Err(FormatError::InvalidLatm(format!("Invalid syncword: {:#06x}", sync)).into());
         }
 
         let audio_mux_length = reader.read_u16(13)? as usize;
@@ -122,6 +122,10 @@ mod tests {
             sampling_rate: SamplingRate::Hz48000,
             channel_config: ChannelConfiguration::Stereo,
             frame_length: crate::types::FrameLength::Samples1024,
+            depends_on_core_coder: false,
+            core_coder_delay: 0,
+            extension_audio_object_type: None,
+            extension_sampling_rate: None,
             sbr_present: false,
             ps_present: false,
         };
