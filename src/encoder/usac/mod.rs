@@ -8,6 +8,7 @@ use crate::decoder::usac::UsacCoreMode;
 pub mod arith;
 pub mod container;
 pub mod fd;
+pub mod lsf;
 pub mod tns;
 
 /// USAC Speech vs Music Classifier and Encoder Engine.

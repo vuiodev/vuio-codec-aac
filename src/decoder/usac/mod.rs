@@ -11,6 +11,7 @@ use crate::error::Result;
 pub mod arith;
 pub mod container;
 pub mod fd;
+pub mod lsf;
 
 /// Core coding mode for a USAC audio frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

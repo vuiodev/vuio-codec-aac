@@ -17,4 +17,5 @@ pub mod scalefactor;
 pub mod sfb;
 pub mod tns;
 pub mod usac_arith;
+pub mod usac_lsf;
 pub mod window;
