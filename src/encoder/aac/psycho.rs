@@ -219,18 +219,33 @@ impl PsychoacousticModel {
         out: &mut PsychoResult,
     ) {
         let bands = self.layout.bands.min(offsets.len().saturating_sub(1));
-        out.bands = bands;
-        out.energy[..bands].fill(0.0);
-
+        let mut energy = [0.0f32; MAX_BANDS];
         for b in 0..bands {
             let lo = offsets[b];
             let hi = offsets[b + 1].min(spectrum.len());
-            let mut energy = 0.0f32;
+            let mut sum = 0.0f32;
             for &c in &spectrum[lo..hi] {
-                energy += c * c;
+                sum += c * c;
             }
-            out.energy[b] = energy;
+            energy[b] = sum;
         }
+        self.analyse_energies(&energy[..bands], sequence, out);
+    }
+
+    /// Run the model over band energies that have already been measured.
+    ///
+    /// An eight-short frame codes each group of windows as one set of bands, so its
+    /// energies come from several windows at once and cannot be read off a single
+    /// spectrum; this is the entry point for that.
+    pub fn analyse_energies(
+        &mut self,
+        energies: &[f32],
+        sequence: WindowSequence,
+        out: &mut PsychoResult,
+    ) {
+        let bands = self.layout.bands.min(energies.len());
+        out.bands = bands;
+        out.energy[..bands].copy_from_slice(&energies[..bands]);
 
         // A band masks itself down to -29 dB, no further than the clip.
         for b in 0..bands {

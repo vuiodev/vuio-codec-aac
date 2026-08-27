@@ -85,6 +85,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             pcm_frame.from_interleaved(&samples[start..start + frame_stride]);
             packets.push(encoder.encode_frame(&pcm_frame)?);
         }
+        packets.push(encoder.flush()?);
         packets
     } else {
         #[cfg(feature = "rayon")]
@@ -107,6 +108,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         pcm.from_interleaved(&chunk[start..start + frame_stride]);
                         local_packets.push(enc.encode_frame(&pcm).unwrap());
                     }
+                    // Each chunk runs its own encoder with its own lookahead, so
+                    // without this the chunk's last frame stays held back forever
+                    // and is silently dropped instead of landing in the next chunk.
+                    local_packets.push(enc.flush().unwrap());
                     local_packets
                 })
                 .collect()

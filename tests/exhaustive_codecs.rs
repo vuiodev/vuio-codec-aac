@@ -13,7 +13,7 @@ use vuiocodecaac::decoder::ps::{PsDecoder, SLOTS as PS_SLOTS};
 use vuiocodecaac::dsp::fft::Complex32;
 use vuiocodecaac::decoder::sbr::{SBR_CORE_FRAME, SbrDecoder};
 use vuiocodecaac::decoder::usac::{UsacCoreMode, UsacDecoder};
-use vuiocodecaac::encoder::aac::block_switch::BlockSwitching;
+use vuiocodecaac::encoder::aac::block_switch::BlockSwitch;
 use vuiocodecaac::encoder::aac::psycho::PsychoacousticModel;
 use vuiocodecaac::encoder::aac::quant::{choose_codebook, quantize_band};
 use vuiocodecaac::encoder::drc::DrcEncoder;
@@ -210,8 +210,12 @@ fn test_psychoacoustic_and_quantization() {
     assert_ne!(choice.codebook, 0, "a nonzero band must get a codebook");
     assert!(choice.bits > 0);
 
-    let mut block_switch = BlockSwitching::new();
-    let (seq, shape) = block_switch.analyze(&spec);
-    assert_eq!(seq, vuiocodecaac::types::WindowSequence::OnlyLongSequence);
-    assert_eq!(shape, vuiocodecaac::types::WindowShape::Sine);
+    // Block switching: a steady tone must never ask for short windows.
+    let mut block_switch = BlockSwitch::new(64000);
+    block_switch.analyse(&spec);
+    let here = block_switch.analyse(&spec);
+    let next = block_switch.analyse(&spec);
+    assert!(!here.attack && !next.attack);
+    let decision = block_switch.decide(here, next);
+    assert_eq!(decision.sequence, vuiocodecaac::types::WindowSequence::OnlyLongSequence);
 }
