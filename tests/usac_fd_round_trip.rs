@@ -177,6 +177,44 @@ fn stereo_signal_round_trips_with_low_error() {
     assert!(snr_r > 20.0, "right channel reconstruction SNR too low: {snr_r:.1} dB");
 }
 
+/// Broadband noise at a budget too tight to code every band pushes real,
+/// non-leakage energy above [`vuiocodecaac::decoder::usac::fd::NOISE_FILLING_START_OFFSET`]
+/// into bands the rate loop quantizes to all zero — exactly the situation
+/// noise filling exists for. This drives the whole pipeline end to end
+/// (unlike the unit tests in `encoder`/`decoder::usac::fd`, which exercise
+/// the mechanism directly) and checks the side info a real encode actually
+/// chose, not a hand-constructed one.
+#[test]
+fn a_tight_budget_on_broadband_noise_turns_on_noise_filling() {
+    use vuiocodecaac::bitstream::BitReader;
+
+    let mut rng = 0x9E3779B97F4A7C15u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        ((rng >> 40) as i32 - 0x800) as f32
+    };
+    let pcm: Vec<f32> = (0..FRAME_LEN).map(|_| next()).collect();
+
+    let mut encoder = UsacFdEncoder::new();
+    encoder.set_budget_bits(600);
+    let block = encoder.encode_frame(&pcm);
+
+    let mut reader = BitReader::new(&block);
+    let _global_gain = reader.read_u8(8).unwrap();
+    let noise_level = reader.read_u8(3).unwrap();
+    let noise_offset = reader.read_u8(5).unwrap();
+    assert!(noise_level > 0, "a tight budget on broadband noise must leave real energy to fill");
+    assert_eq!(noise_offset, 16, "this encoder's noise_offset is always the shift-free value");
+
+    // The frame must still decode to something real, not just parse.
+    let mut decoder = UsacFdDecoder::new();
+    let mut reader = BitReader::new(&block);
+    let out = decoder.decode_frame(&mut reader).expect("a noise-filled frame must still decode");
+    assert_eq!(out.len(), FRAME_LEN);
+}
+
 #[test]
 fn silence_round_trips_exactly() {
     let frames = 4;

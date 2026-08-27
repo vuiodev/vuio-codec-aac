@@ -4,10 +4,10 @@
 //! exercises the spectral arithmetic coder in
 //! [`crate::encoder::usac::arith`] end to end: FD core mode only, fixed
 //! 1024-sample long windows. What it deliberately does not cover — ACELP,
-//! TCX, USAC's complex-prediction stereo, TNS, noise filling, MPEG
-//! Surround, and the general `UsacConfig()`/element-tree signalling a real
-//! stream needs — is separate, larger work; see the arithmetic-coder
-//! module's own doc for why that split makes sense.
+//! TCX, USAC's complex-prediction stereo, TNS, MPEG Surround, and the
+//! general `UsacConfig()`/element-tree signalling a real stream needs — is
+//! separate, larger work; see the arithmetic-coder module's own doc for why
+//! that split makes sense.
 //!
 //! # Reused, not reinvented
 //!
@@ -59,8 +59,50 @@
 //! moment scalefactors actually vary per band. See
 //! [`crate::decoder::usac::fd`] for the fix: the decoder now keeps the whole
 //! per-band array and dequantizes each band with its own value.
+//!
+//! # Noise filling, simplified deliberately
+//!
+//! The reference encoder's `iusace_noise_filling` picks `noise_level` and
+//! `noise_offset` from a log-domain ratio of "energy in bands that coded to
+//! all zero" against "energy in bands that didn't", using several constants
+//! (`alpha = 0.15`, and offsets of `-50`/`-58` in the two sides of the
+//! ratio) that are calibrated to that encoder's own internal fixed-point
+//! spectrum and scalefactor conventions — conventions this port does not
+//! reuse (this encoder works in [`crate::encoder::aac::quant`]'s floating
+//! point convention throughout). Transplanting those specific constants
+//! without the matching internal scale would be porting numbers, not the
+//! algorithm, and there is no reference decoder handy to check the result
+//! against — so this chooses `noise_level`/`noise_offset` a different way,
+//! one calibrated to this encoder's own units and checkable by construction:
+//!
+//! 1. [`crate::decoder::usac::fd::NOISE_FILLING_START_OFFSET`] and later
+//!    bands that quantized to *all* zero are exactly the bands the decoder
+//!    will noise-fill (see that module's docs) — so collect the true,
+//!    pre-quantization spectral energy the encoder discarded in exactly
+//!    those bands.
+//! 2. Fix `noise_offset` at 16 — per the decoder's `scalefactor +
+//!    (noise_offset - 16)` shift, this is a documented no-op, so a fully
+//!    zeroed band's noise is reconstructed at exactly its own transmitted
+//!    scalefactor's level, no extra parameter to solve for.
+//! 3. For each of the 8 possible `noise_level` values, predict what the
+//!    decoder will actually reconstruct (replaying
+//!    `ixheaacd_esc_iquant`'s noise-branch arithmetic — the `>> 25`
+//!    fixed-point shift, then this codec's `/ 64` unit conversion, both
+//!    already established in [`crate::decoder::usac::fd`]) and keep whichever
+//!    level's predicted magnitude is closest, in a least-squares sense, to
+//!    the energy actually discarded. A discarded-energy floor near zero
+//!    picks `noise_level = 0`, which both this encoder and the decoder treat
+//!    as "off" — no separate flag needed.
+//!
+//! This does not reproduce the reference bit-for-bit, but the *bitstream
+//! contract* — field widths, the start-offset rule, the whole-zeroed-band
+//! shift — is exact, checked directly against `ixheaacd_apply_scfs_and_nf`;
+//! what differs is only the perceptual judgment of which of the 8 legal
+//! noise levels the encoder decides fits best.
 
 use crate::bitstream::BitWriter;
+use crate::decoder::usac::fd::NOISE_FILLING_START_OFFSET;
+use crate::tables::usac_arith::{POW_14_3, TABLE_EXP, TABLE_FRAC};
 use crate::dsp::fft::Complex32;
 use crate::dsp::mdct::MdctContext;
 use crate::dsp::window::generate_sine_window_f32;
@@ -181,18 +223,19 @@ impl UsacFdEncoder {
     }
 
     /// Encode one 1024-sample frame into a byte-aligned raw block:
-    /// `global_gain`, `scale_factor_data()`, then the arithmetic-coded
-    /// spectral data.
+    /// `global_gain`, the noise-filling side info, `scale_factor_data()`,
+    /// then the arithmetic-coded spectral data.
     pub fn encode_frame(&mut self, pcm: &[f32]) -> Vec<u8> {
         assert_eq!(pcm.len(), FRAME_LEN);
         self.channel.transform(pcm, &self.window, &self.mdct, &mut self.scratch);
 
         let num_sfb = self.layout.num_sfb;
+        let sfb_offsets = &self.layout.sfb_offsets[..=num_sfb];
         let mut scalefactors = vec![SF_OFFSET; num_sfb];
         let mut quant = vec![0i32; FRAME_LEN];
         fit_scalefactors(
             &self.channel.spectrum,
-            &self.layout.sfb_offsets[..=num_sfb],
+            sfb_offsets,
             num_sfb,
             &mut self.channel.model,
             &mut self.channel.psycho,
@@ -201,9 +244,11 @@ impl UsacFdEncoder {
             &mut scalefactors,
             &mut quant,
         );
+        let (noise_level, noise_offset) =
+            choose_noise_level(&self.channel.spectrum, sfb_offsets, num_sfb, &scalefactors, &quant);
 
         let mut writer = BitWriter::with_capacity(FRAME_LEN);
-        write_scale_factor_data(&mut writer, &scalefactors);
+        write_channel_header(&mut writer, &scalefactors, noise_level, noise_offset);
         let pairs = FRAME_LEN / 2;
         encode_pairs(&mut writer, &mut self.channel.contexts, &quant, pairs, pairs);
         writer.byte_align_zero();
@@ -262,7 +307,8 @@ impl UsacFdStereoEncoder {
 
     /// Encode one 1024-sample stereo frame into a byte-aligned raw block:
     /// the per-band mid/side mask, then each channel's `global_gain` +
-    /// `scale_factor_data()` + arithmetic-coded spectral data in turn.
+    /// noise-filling side info + `scale_factor_data()` + arithmetic-coded
+    /// spectral data in turn.
     pub fn encode_frame(&mut self, left: &[f32], right: &[f32]) -> Vec<u8> {
         assert_eq!(left.len(), FRAME_LEN);
         assert_eq!(right.len(), FRAME_LEN);
@@ -279,12 +325,13 @@ impl UsacFdStereoEncoder {
         }
 
         let num_sfb = self.layout.num_sfb;
+        let sfb_offsets = &self.layout.sfb_offsets[..=num_sfb];
         for ch in &mut self.channels {
             let mut scalefactors = vec![SF_OFFSET; num_sfb];
             let mut quant = vec![0i32; FRAME_LEN];
             fit_scalefactors(
                 &ch.spectrum,
-                &self.layout.sfb_offsets[..=num_sfb],
+                sfb_offsets,
                 num_sfb,
                 &mut ch.model,
                 &mut ch.psycho,
@@ -293,7 +340,9 @@ impl UsacFdStereoEncoder {
                 &mut scalefactors,
                 &mut quant,
             );
-            write_scale_factor_data(&mut writer, &scalefactors);
+            let (noise_level, noise_offset) =
+                choose_noise_level(&ch.spectrum, sfb_offsets, num_sfb, &scalefactors, &quant);
+            write_channel_header(&mut writer, &scalefactors, noise_level, noise_offset);
             let pairs = FRAME_LEN / 2;
             encode_pairs(&mut writer, &mut ch.contexts, &quant, pairs, pairs);
         }
@@ -352,6 +401,12 @@ impl Default for UsacFdStereoEncoder {
 
 /// Write `global_gain` followed by one Huffman-coded delta per remaining
 /// band, exactly the shape [`crate::decoder::usac::fd`] reads back.
+///
+/// Used only for [`attempt`]'s trial-cost measurement, which has no noise
+/// side info to add yet (that's chosen from the *final* winning trial, after
+/// the search is done) — a fixed 8-bit difference from the real header
+/// every trial shares equally, so it does not affect which trial wins. The
+/// real output goes through [`write_channel_header`] instead.
 fn write_scale_factor_data(writer: &mut BitWriter, scalefactors: &[i32]) {
     writer.write_u8(scalefactors[0].clamp(0, 255) as u8, 8);
     let mut previous = scalefactors[0];
@@ -359,6 +414,120 @@ fn write_scale_factor_data(writer: &mut BitWriter, scalefactors: &[i32]) {
         write_scalefactor_delta(writer, sf - previous);
         previous = sf;
     }
+}
+
+/// Write one channel's real `FDChannelStream()` header: `global_gain` (8
+/// bits), `noise_level` (3 bits), `noise_offset` (5 bits), then one
+/// Huffman-coded scalefactor delta per remaining band — the exact order
+/// [`crate::decoder::usac::fd`]'s `read_channel_header` reads back (see this
+/// module's noise-filling docs for why `noise_level`/`noise_offset` sit
+/// here).
+fn write_channel_header(
+    writer: &mut BitWriter,
+    scalefactors: &[i32],
+    noise_level: i32,
+    noise_offset: i32,
+) {
+    writer.write_u8(scalefactors[0].clamp(0, 255) as u8, 8);
+    writer.write_u8(noise_level as u8, 3);
+    writer.write_u8(noise_offset as u8, 5);
+    let mut previous = scalefactors[0];
+    for &sf in &scalefactors[1..] {
+        write_scalefactor_delta(writer, sf - previous);
+        previous = sf;
+    }
+}
+
+/// Mirrors [`crate::decoder::usac::fd`]'s private `fac_fix` exactly — needed
+/// here only to predict, for a candidate noise level, what the decoder will
+/// actually reconstruct (see this module's noise-filling docs).
+fn fac_fix_local(scalefactor: i32) -> i64 {
+    let fac = scalefactor - SF_OFFSET;
+    if fac < 0 {
+        return 0;
+    }
+    let exp = (fac >> 2).min(31) as usize;
+    let frac = (fac & 3) as usize;
+    (TABLE_FRAC[3 + frac] as i64 * TABLE_EXP[exp]) >> 15
+}
+
+/// The same fixed-point-to-linear conversion documented at
+/// [`crate::decoder::usac::fd`]'s `ARITH_FIXED_POINT_SHIFT`; duplicated here
+/// (as an `f64`, for the noise-level search's precision) rather than made
+/// `pub` there, matching this pair of modules' existing convention of small,
+/// deliberate duplication over cross-module coupling.
+const ARITH_FIXED_POINT_SHIFT: f64 = 64.0;
+
+/// What the decoder will reconstruct for one noise-filled coefficient in a
+/// band at `scalefactor`, given `noise_level_fixed = POW_14_3[noise_level]`
+/// — replaying `ixheaacd_esc_iquant`'s noise branch (`(fac_fix * level) >>
+/// 25`) and then this codec's fixed-point-to-linear scale, so the result is
+/// directly comparable to this encoder's own (linear, unquantized) spectrum
+/// values.
+fn predicted_noise_magnitude(scalefactor: i32, noise_level_fixed: i32) -> f64 {
+    let fac = fac_fix_local(scalefactor) as f64;
+    (fac * noise_level_fixed as f64 / (1i64 << 25) as f64) / ARITH_FIXED_POINT_SHIFT
+}
+
+/// Choose `(noise_level, noise_offset)` for one channel's frame — see this
+/// module's noise-filling docs for the reasoning. `noise_offset` is always
+/// either `0` (noise filling off) or `16` (the shift-free value); only
+/// `noise_level` is actually searched.
+fn choose_noise_level(
+    spectrum: &[f32],
+    sfb_offsets: &[usize],
+    num_sfb: usize,
+    scalefactors: &[i32],
+    quant: &[i32],
+) -> (i32, i32) {
+    let mut zeroed_bands: Vec<(usize, usize, i32)> = Vec::new();
+    let mut discarded_energy = 0.0f64;
+    let mut discarded_count = 0usize;
+
+    for b in 0..num_sfb {
+        let lo = sfb_offsets[b];
+        let hi = sfb_offsets[b + 1].min(spectrum.len());
+        if lo >= hi || lo < NOISE_FILLING_START_OFFSET {
+            continue;
+        }
+        if quant[lo..hi].iter().all(|&q| q == 0) {
+            for &x in &spectrum[lo..hi] {
+                discarded_energy += (x as f64).powi(2);
+            }
+            discarded_count += hi - lo;
+            zeroed_bands.push((lo, hi, scalefactors[b]));
+        }
+    }
+
+    if zeroed_bands.is_empty() || discarded_count == 0 {
+        return (0, 0);
+    }
+    // A discarded floor this quiet is not worth eight bits of side info —
+    // and the least-squares search below would land on level 0 anyway, so
+    // this is purely a fast path.
+    if (discarded_energy / discarded_count as f64).sqrt() < 1.0 {
+        return (0, 0);
+    }
+
+    let mut best_level = 0i32;
+    let mut best_error = f64::MAX;
+    for level in 0..=7i32 {
+        let noise_level_fixed = POW_14_3[level as usize];
+        let mut error = 0.0f64;
+        for &(lo, hi, sf) in &zeroed_bands {
+            let predicted = predicted_noise_magnitude(sf, noise_level_fixed);
+            for &x in &spectrum[lo..hi] {
+                let d = predicted - (x as f64).abs();
+                error += d * d;
+            }
+        }
+        if error < best_error {
+            best_error = error;
+            best_level = level;
+        }
+    }
+
+    if best_level == 0 { (0, 0) } else { (best_level, 16) }
 }
 
 /// Search for the coarsest-fitting-under-budget set of per-band
@@ -584,5 +753,68 @@ mod tests {
         );
 
         assert!(tight < generous, "tightening the budget cost more bits: {tight} vs {generous}");
+    }
+
+    /// A band past the noise-filling start offset that quantized to all
+    /// zero, but carried real pre-quantization energy, must pick a nonzero
+    /// noise level — otherwise the search silently never turns the tool on.
+    #[test]
+    fn discarded_high_frequency_energy_turns_on_noise_filling() {
+        let layout = Layout::new();
+        let num_sfb = layout.num_sfb;
+        let sfb = num_sfb - 1;
+        let lo = layout.sfb_offsets[sfb];
+        let hi = layout.sfb_offsets[sfb + 1].min(FRAME_LEN);
+        assert!(lo >= NOISE_FILLING_START_OFFSET, "test needs a band past the start offset");
+
+        let mut spectrum = vec![0.0f32; FRAME_LEN];
+        spectrum[lo..hi].fill(500.0);
+        let quant = vec![0i32; FRAME_LEN];
+        let mut scalefactors = vec![SF_OFFSET; num_sfb];
+        scalefactors[sfb] = SF_OFFSET + 40;
+
+        let (level, offset) =
+            choose_noise_level(&spectrum, &layout.sfb_offsets, num_sfb, &scalefactors, &quant);
+        assert!(level > 0, "real discarded energy must not be ignored");
+        assert_eq!(offset, 16, "a nonzero level always pairs with the shift-free offset");
+    }
+
+    /// A band that is not actually all zero must never be treated as a
+    /// noise-filling candidate, whatever its unquantized energy — the tool
+    /// only ever fills gaps a real coefficient could not otherwise reach.
+    #[test]
+    fn a_band_with_any_nonzero_coefficient_is_never_a_noise_candidate() {
+        let layout = Layout::new();
+        let num_sfb = layout.num_sfb;
+        let sfb = num_sfb - 1;
+        let lo = layout.sfb_offsets[sfb];
+        let hi = layout.sfb_offsets[sfb + 1].min(FRAME_LEN);
+
+        let mut spectrum = vec![0.0f32; FRAME_LEN];
+        spectrum[lo..hi].fill(500.0);
+        let mut quant = vec![0i32; FRAME_LEN];
+        quant[lo] = 3;
+        let mut scalefactors = vec![SF_OFFSET; num_sfb];
+        scalefactors[sfb] = SF_OFFSET + 40;
+
+        let (level, offset) =
+            choose_noise_level(&spectrum, &layout.sfb_offsets, num_sfb, &scalefactors, &quant);
+        assert_eq!((level, offset), (0, 0));
+    }
+
+    /// A spectrum with nothing meaningfully discarded above the start
+    /// offset must leave noise filling off — the search should not invent
+    /// side info to spend on silence that was genuinely silence.
+    #[test]
+    fn near_silence_leaves_noise_filling_off() {
+        let layout = Layout::new();
+        let num_sfb = layout.num_sfb;
+        let spectrum = vec![0.0f32; FRAME_LEN];
+        let quant = vec![0i32; FRAME_LEN];
+        let scalefactors = vec![SF_OFFSET; num_sfb];
+
+        let (level, offset) =
+            choose_noise_level(&spectrum, &layout.sfb_offsets, num_sfb, &scalefactors, &quant);
+        assert_eq!((level, offset), (0, 0));
     }
 }

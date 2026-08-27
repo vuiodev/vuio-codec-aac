@@ -9,6 +9,27 @@
 //! this path never has anything else to feed it). See that module's docs
 //! for what is and is not covered by this minimal shape.
 //!
+//! # Noise filling
+//!
+//! `FDChannelStream()` also carries `noise_level` (3 bits) and
+//! `noise_offset` (5 bits) right after `global_gain` — the reference only
+//! sends these when the stream's `noiseFilling` config flag is set, but this
+//! minimal path has no persistent per-element config, so it always carries
+//! the field and lets `noise_level == 0` mean "off this frame" (a valid,
+//! spec-legal value, not a special case). Reproduced from
+//! `ixheaacd_apply_scfs_and_nf`: a coefficient only gets synthesized rather
+//! than left silent when its *band's start* offset is at or past
+//! [`NOISE_FILLING_START_OFFSET`] (noise filling never reaches into the
+//! bands a real encoder actually spends bits shaping), and a band that
+//! quantized to *all* zeros has its effective scale shifted by
+//! `noise_offset - 16` first, since a fully-silent band's transmitted
+//! scalefactor says nothing about what level of noise belongs there.
+//!
+//! `noise_offset - 16` being a no-op shift at `noise_offset == 16` is not a
+//! coincidence this decoder relies on — see
+//! [`crate::encoder::usac::fd`]'s noise-filling docs for why the encoder
+//! here always transmits exactly that value.
+//!
 //! # A decode-side bug the per-band rate loop surfaced
 //!
 //! The single-scalefactor-per-frame version of this decoder accumulated
@@ -18,7 +39,7 @@
 //! first, but is wrong the moment scalefactors genuinely vary per band: the
 //! final accumulated value has nothing to do with any individual band's
 //! actual scalefactor. [`UsacFdDecoder::decode_frame`] now keeps the whole
-//! per-band array from [`read_scale_factor_data`] and dequantizes each
+//! per-band array from [`read_channel_header`] and dequantizes each
 //! band's coefficient range with its own value, matching what
 //! [`crate::encoder::usac::fd`]'s real per-band rate loop now transmits.
 
@@ -30,7 +51,7 @@ use crate::dsp::filterbank::Filterbank;
 use crate::error::Result;
 use crate::tables::scalefactor::{MAX_SFB_LONG, compute_sfb_offsets};
 use crate::tables::sfb::SFB_48_1024;
-use crate::tables::usac_arith::{Contexts, TABLE_EXP, TABLE_FRAC};
+use crate::tables::usac_arith::{Contexts, POW_14_3, TABLE_EXP, TABLE_FRAC};
 use crate::types::{WindowSequence, WindowShape};
 
 /// Samples per frame this minimal path codes; see
@@ -47,6 +68,15 @@ pub const FRAME_LEN: usize = 1024;
 /// quantized in, rather than a fixed-point convention that only matters
 /// inside the reference decoder's own downstream stages.
 const ARITH_FIXED_POINT_SHIFT: f32 = 64.0;
+
+/// Coefficient index below which noise filling never applies, matching
+/// `ixheaacd_apply_scfs_and_nf`'s `1024`-sample-frame, long-window case
+/// (`(usac_data->ccfl == 768) ? ... : (islong ? 160 : 20)` — this minimal
+/// path is always the `1024`/long branch). A band only counts once its
+/// *start* reaches this offset, not merely any coefficient inside it — a
+/// band straddling the boundary is left alone entirely, same as the
+/// reference.
+pub const NOISE_FILLING_START_OFFSET: usize = 160;
 
 /// Bands [`SFB_48_1024`] resolves to; shared setup both the mono and stereo
 /// decoders need.
@@ -82,29 +112,44 @@ impl ChannelState {
     }
 }
 
-/// Read `global_gain` followed by one Huffman-coded delta per remaining
-/// band into a full per-band scalefactor array, the shape
-/// [`crate::encoder::usac::fd::write_scale_factor_data`] writes.
-fn read_scale_factor_data(reader: &mut BitReader, num_sfb: usize) -> Result<Vec<i32>> {
+/// One channel's `FDChannelStream()` header: `global_gain`, the noise-filling
+/// side info, and the per-band scalefactor array — everything
+/// [`dequantize_channel`] needs, read in the exact order
+/// [`crate::encoder::usac::fd::write_channel_header`] writes it.
+struct ChannelHeader {
+    noise_level: i32,
+    noise_offset: i32,
+    scalefactors: Vec<i32>,
+}
+
+/// Read one channel's header: `global_gain` (8 bits), `noise_level` (3
+/// bits), `noise_offset` (5 bits), then one Huffman-coded scalefactor delta
+/// per remaining band.
+fn read_channel_header(reader: &mut BitReader, num_sfb: usize) -> Result<ChannelHeader> {
     let mut scalefactors = vec![0i32; num_sfb];
     scalefactors[0] = reader.read_u8(8)? as i32;
+    let noise_level = reader.read_u8(3)? as i32;
+    let noise_offset = reader.read_u8(5)? as i32;
     for b in 1..num_sfb {
         scalefactors[b] = scalefactors[b - 1] + decode_scalefactor_delta(reader)?;
     }
-    Ok(scalefactors)
+    Ok(ChannelHeader { noise_level, noise_offset, scalefactors })
 }
 
-/// Dequantize one channel's coded magnitudes band by band, each with its
-/// own scalefactor, and scale the arithmetic coder's fixed-point output
-/// down into the same linear units the encoder quantized in.
+/// Dequantize one channel's coded magnitudes band by band, each with its own
+/// scalefactor, synthesizing noise wherever [`NOISE_FILLING_START_OFFSET`]
+/// and a nonzero `noise_level` say to (see module docs), and scale the
+/// arithmetic coder's fixed-point output down into the same linear units the
+/// encoder quantized in.
 fn dequantize_channel(
     quant: &[i32],
     sfb_offsets: &[usize],
     num_sfb: usize,
-    scalefactors: &[i32],
+    header: &ChannelHeader,
     noise_seed: &mut u32,
     spectral: &mut [f32],
 ) {
+    let noise_level_fixed = POW_14_3[header.noise_level.clamp(0, 7) as usize];
     let mut coef = vec![0i32; quant.len()];
     for b in 0..num_sfb {
         let lo = sfb_offsets[b];
@@ -112,7 +157,21 @@ fn dequantize_channel(
         if lo >= hi {
             continue;
         }
-        dequantize(&quant[lo..hi], &mut coef[lo..hi], 0, false, noise_seed, fac_fix(scalefactors[b]));
+        let present = header.noise_level != 0 && lo >= NOISE_FILLING_START_OFFSET;
+        let band_all_zero = quant[lo..hi].iter().all(|&q| q == 0);
+        let scalefactor = if present && band_all_zero {
+            header.scalefactors[b] + (header.noise_offset - 16)
+        } else {
+            header.scalefactors[b]
+        };
+        dequantize(
+            &quant[lo..hi],
+            &mut coef[lo..hi],
+            noise_level_fixed,
+            present,
+            noise_seed,
+            fac_fix(scalefactor),
+        );
     }
     for (s, &c) in spectral.iter_mut().zip(coef.iter()) {
         *s = c as f32 / ARITH_FIXED_POINT_SHIFT;
@@ -133,7 +192,7 @@ impl UsacFdDecoder {
     /// Decode one frame's raw block into `FRAME_LEN` PCM samples.
     pub fn decode_frame(&mut self, reader: &mut BitReader) -> Result<Vec<f32>> {
         let num_sfb = self.layout.num_sfb;
-        let scalefactors = read_scale_factor_data(reader, num_sfb)?;
+        let header = read_channel_header(reader, num_sfb)?;
 
         let pairs = FRAME_LEN / 2;
         let mut quant = vec![0i32; FRAME_LEN];
@@ -144,7 +203,7 @@ impl UsacFdDecoder {
             &quant,
             &self.layout.sfb_offsets,
             num_sfb,
-            &scalefactors,
+            &header,
             &mut self.channel.noise_seed,
             &mut spectral,
         );
@@ -190,7 +249,7 @@ impl UsacFdStereoDecoder {
 
         let mut spectral = [vec![0.0f32; FRAME_LEN], vec![0.0f32; FRAME_LEN]];
         for (ch, spec) in self.channels.iter_mut().zip(spectral.iter_mut()) {
-            let scalefactors = read_scale_factor_data(reader, num_sfb)?;
+            let header = read_channel_header(reader, num_sfb)?;
             let pairs = FRAME_LEN / 2;
             let mut quant = vec![0i32; FRAME_LEN];
             decode_pairs(reader, &mut ch.contexts, pairs, pairs, &mut quant);
@@ -198,7 +257,7 @@ impl UsacFdStereoDecoder {
                 &quant,
                 &self.layout.sfb_offsets,
                 num_sfb,
-                &scalefactors,
+                &header,
                 &mut ch.noise_seed,
                 spec,
             );
@@ -262,4 +321,97 @@ fn fac_fix(scalefactor: i32) -> i64 {
     let exp = (fac >> 2).min(31) as usize;
     let frac = (fac & 3) as usize;
     (TABLE_FRAC[3 + frac] as i64 * TABLE_EXP[exp]) >> 15
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout() -> Layout {
+        Layout::new()
+    }
+
+    /// A band whose quantized values are all zero, at or past
+    /// [`NOISE_FILLING_START_OFFSET`], must come out of dequantization
+    /// nonzero when noise filling is on: this is the whole point of the
+    /// tool, and it is easy to wire up a gate that never actually fires.
+    #[test]
+    fn noise_filling_synthesizes_a_fully_zeroed_high_band() {
+        let layout = layout();
+        let num_sfb = layout.num_sfb;
+        let sfb = num_sfb - 1;
+        let lo = layout.sfb_offsets[sfb];
+        let hi = layout.sfb_offsets[sfb + 1].min(FRAME_LEN);
+        assert!(lo >= NOISE_FILLING_START_OFFSET, "test needs a band past the start offset");
+
+        let mut quant = vec![0i32; FRAME_LEN];
+        // Give a low band real (nonzero) content so it is not itself
+        // eligible for the whole-band shift, and leave the high test band
+        // at its default all-zero.
+        quant[0] = 5;
+
+        let mut scalefactors = vec![SF_OFFSET; num_sfb];
+        scalefactors[sfb] = SF_OFFSET + 40;
+        let header = ChannelHeader { noise_level: 5, noise_offset: 16, scalefactors };
+
+        let mut spectral = vec![0.0f32; FRAME_LEN];
+        let mut seed = 7u32;
+        dequantize_channel(&quant, &layout.sfb_offsets, num_sfb, &header, &mut seed, &mut spectral);
+
+        assert!(
+            spectral[lo..hi].iter().any(|&v| v != 0.0),
+            "a noise-filled band must not stay silent"
+        );
+    }
+
+    /// `noise_level == 0` must leave every zeroed band exactly silent — the
+    /// field's "off" value has to actually turn the tool off, not just
+    /// pick the quietest nonzero level.
+    #[test]
+    fn noise_level_zero_leaves_zeroed_bands_silent() {
+        let layout = layout();
+        let num_sfb = layout.num_sfb;
+        let quant = vec![0i32; FRAME_LEN];
+        let scalefactors = vec![SF_OFFSET; num_sfb];
+        let header = ChannelHeader { noise_level: 0, noise_offset: 0, scalefactors };
+
+        let mut spectral = vec![0.0f32; FRAME_LEN];
+        let mut seed = 7u32;
+        dequantize_channel(&quant, &layout.sfb_offsets, num_sfb, &header, &mut seed, &mut spectral);
+
+        assert!(spectral.iter().all(|&v| v == 0.0), "noise_level 0 must mean no synthesis at all");
+    }
+
+    /// A band whose *start* sits before [`NOISE_FILLING_START_OFFSET`] must
+    /// stay silent even with noise filling on — the reference gates on the
+    /// band's start, not on any individual coefficient's position, so the
+    /// last band entirely below the threshold is skipped entirely (as would
+    /// be a band straddling it, though this table's band boundaries happen
+    /// to land exactly on 160, so there is no such band to test directly).
+    #[test]
+    fn a_band_starting_before_the_offset_is_never_filled() {
+        let layout = layout();
+        let num_sfb = layout.num_sfb;
+        let start_sfb = (0..num_sfb)
+            .find(|&sfb| layout.sfb_offsets[sfb] >= NOISE_FILLING_START_OFFSET)
+            .expect("some band must reach the start offset");
+        let low_sfb = start_sfb - 1;
+        let lo = layout.sfb_offsets[low_sfb];
+        let hi = layout.sfb_offsets[low_sfb + 1].min(FRAME_LEN);
+        assert!(lo < NOISE_FILLING_START_OFFSET, "test needs a band entirely below the offset");
+
+        let quant = vec![0i32; FRAME_LEN];
+        let mut scalefactors = vec![SF_OFFSET; num_sfb];
+        scalefactors[low_sfb] = SF_OFFSET + 40;
+        let header = ChannelHeader { noise_level: 7, noise_offset: 16, scalefactors };
+
+        let mut spectral = vec![0.0f32; FRAME_LEN];
+        let mut seed = 7u32;
+        dequantize_channel(&quant, &layout.sfb_offsets, num_sfb, &header, &mut seed, &mut spectral);
+
+        assert!(
+            spectral[lo..hi].iter().all(|&v| v == 0.0),
+            "a band starting below the offset must never be noise-filled"
+        );
+    }
 }
