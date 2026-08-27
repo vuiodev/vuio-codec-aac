@@ -7,7 +7,7 @@ use vuiocodecaac::decoder::aac::ics::{ChannelData, IcsInfo, INTENSITY_HCB, NOISE
 use vuiocodecaac::decoder::aac::stereo::{MsMask, apply_intensity_stereo, apply_ms_stereo};
 use vuiocodecaac::decoder::aac::tns::{ar_filter, ma_filter, parcor_to_lpc};
 use vuiocodecaac::tables::scalefactor::{MAX_SFB_LONG, compute_sfb_offsets};
-use vuiocodecaac::decoder::drc::DrcDecoder;
+use vuiocodecaac::decoder::drc::{DrcDecoder, DrcSettings};
 use vuiocodecaac::decoder::mps::{MpsDecoder, MpsSpatialCues};
 use vuiocodecaac::decoder::ps::{PsDecoder, SLOTS as PS_SLOTS};
 use vuiocodecaac::dsp::fft::Complex32;
@@ -173,14 +173,20 @@ fn test_mps_usac_and_drc() {
     usac_dec.decode_acelp_subframe(&mut reader, 16, 0.7, 0.4, &mut acelp_out).unwrap();
     assert_eq!(acelp_out.len(), 64);
 
-    // DRC
-    let drc_enc = DrcEncoder::new(-23.0);
-    let mut drc_dec = DrcDecoder::new(-23.0);
-    let mut drc_pcm = vec![vec![0.8f32; 512]; 2];
-    let drc_slices = [&drc_pcm[0][..], &drc_pcm[1][..]];
-    let drc_data = drc_enc.measure_and_generate_drc(&drc_slices);
-    drc_dec.process_frame(&mut drc_pcm, &drc_data).unwrap();
-    assert_eq!(drc_pcm[0].len(), 512);
+    // DRC: measure a frame, write its metadata, and read it back through the
+    // decoder, which must then attenuate a loud programme.
+    let mut drc_enc = DrcEncoder::new(44100, 2, -23.0);
+    let loud: Vec<f32> = (0..44100)
+        .map(|i| 0.9 * (std::f32::consts::TAU * 1000.0 * i as f32 / 44100.0).sin())
+        .collect();
+    let info = drc_enc.analyse(&[&loud, &loud]);
+    assert!(info.gain[0] < 0, "a loud programme should ask to be turned down");
+
+    let mut drc_dec = DrcDecoder::new(DrcSettings::full_compression());
+    drc_dec.accept(info);
+    let mut spectrum = vec![1.0f32; 512];
+    drc_dec.apply_to_spectrum(0, &mut spectrum);
+    assert!(spectrum[0] < 1.0, "the decoder ignored the metadata");
 }
 
 #[test]

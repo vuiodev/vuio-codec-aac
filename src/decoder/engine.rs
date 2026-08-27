@@ -20,6 +20,7 @@ use crate::decoder::aac::dequant::inverse_quantize_channel;
 use crate::decoder::aac::pns::{NoiseMode, NoiseRng, apply_pns};
 use crate::decoder::aac::stereo::{MsMask, apply_intensity_stereo, apply_ms_stereo};
 use crate::decoder::aac::tns::apply_tns;
+use crate::decoder::drc::{DrcDecoder, DrcInfo, DrcSettings};
 use crate::decoder::sbr::{SBR_CORE_FRAME, SbrDecoder, SbrElement};
 use crate::dsp::filterbank::Filterbank;
 use crate::error::{DecodeError, Result};
@@ -35,7 +36,6 @@ pub const MAX_CHANNELS: usize = 8;
 /// Extension payload identifiers that may appear in a fill element.
 mod extension {
     /// Dynamic range control metadata.
-    #[allow(dead_code)]
     pub const DYNAMIC_RANGE: u8 = 11;
     /// Spectral band replication payload.
     pub const SBR_DATA: u8 = 13;
@@ -142,6 +142,8 @@ pub struct Decoder {
     elements: Vec<(usize, usize)>,
     /// Holds a channel's core frame while the replicator writes its output.
     sbr_scratch: Vec<f32>,
+    /// Dynamic range control, which does nothing until a listener asks for it.
+    drc: DrcDecoder,
 }
 
 impl Decoder {
@@ -165,7 +167,28 @@ impl Decoder {
             sbr_active: false,
             elements: Vec::new(),
             sbr_scratch: Vec::new(),
+            drc: DrcDecoder::default(),
         }
+    }
+
+    /// Say what to do with any dynamic range metadata the stream carries.
+    ///
+    /// The default honours none of it, which decodes a stream carrying DRC exactly
+    /// as it would one that did not.
+    pub fn set_drc_settings(&mut self, settings: DrcSettings) {
+        self.drc.set_settings(settings);
+    }
+
+    /// What the decoder is currently doing with dynamic range metadata.
+    #[inline]
+    pub fn drc_settings(&self) -> DrcSettings {
+        self.drc.settings()
+    }
+
+    /// Whether the stream has been found to carry dynamic range metadata.
+    #[inline]
+    pub fn drc_present(&self) -> bool {
+        self.drc.is_present()
     }
 
     /// Create a default stereo AAC-LC decoder at 44.1 kHz.
@@ -243,6 +266,7 @@ impl Decoder {
         for sbr in &mut self.sbr {
             sbr.reset();
         }
+        self.drc.reset();
     }
 
     /// Generator to use for `channel` of the frame being decoded.
@@ -281,11 +305,22 @@ impl Decoder {
         let produced = self.decode_raw_data_block(&mut reader)?;
         self.active_channels = produced.max(1);
 
+        if self.drc.is_active() && !self.sbr_active {
+            for ch in 0..self.active_channels.min(MAX_CHANNELS) {
+                self.drc.apply_to_spectrum(ch, &mut self.channels[ch].pcm);
+            }
+        }
+
         if self.sbr_active {
             self.apply_band_replication()?;
             // Parametric stereo may have widened the frame past what the core
             // decoded, so the channel count is only final once it has run.
             self.active_channels = self.replicated_channels().clamp(1, MAX_CHANNELS);
+            if self.drc.is_active() {
+                for ch in 0..self.active_channels {
+                    self.drc.apply_to_samples(ch, &mut self.channels[ch].sbr_pcm);
+                }
+            }
         }
 
         let frame_len = self.frame_length();
@@ -471,11 +506,21 @@ impl Decoder {
         let start = reader.bit_position();
 
         let kind = reader.read_u8(4)?;
-        if matches!(kind, extension::SBR_DATA | extension::SBR_DATA_CRC)
-            && let Some(target) = target
-        {
-            let with_crc = kind == extension::SBR_DATA_CRC;
-            self.decode_sbr_payload(reader, target, with_crc);
+        match kind {
+            extension::SBR_DATA | extension::SBR_DATA_CRC => {
+                if let Some(target) = target {
+                    let with_crc = kind == extension::SBR_DATA_CRC;
+                    self.decode_sbr_payload(reader, target, with_crc);
+                }
+            }
+            extension::DYNAMIC_RANGE => {
+                // Metadata that fails to parse is dropped: the audio is unaffected,
+                // and the previous frame's settings hold until the next good payload.
+                if let Ok(info) = DrcInfo::parse(reader) {
+                    self.drc.accept(info);
+                }
+            }
+            _ => {}
         }
 
         let consumed = reader.bit_position() - start;

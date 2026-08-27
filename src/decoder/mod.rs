@@ -17,7 +17,7 @@ pub mod ps;
 pub mod sbr;
 pub mod usac;
 
-pub use drc::{DrcDecoder, DrcFrameData};
+pub use drc::{DrcDecoder, DrcInfo, DrcSettings};
 pub use engine::Decoder;
 pub use mps::{MpsDecoder, MpsSpatialCues};
 pub use ps::{PsData, PsDecoder};
