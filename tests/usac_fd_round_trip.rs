@@ -215,6 +215,60 @@ fn a_tight_budget_on_broadband_noise_turns_on_noise_filling() {
     assert_eq!(out.len(), FRAME_LEN);
 }
 
+/// A signal with a strong short-term envelope across the spectrum (the exact
+/// shape `src/encoder/usac/tns.rs`'s own unit tests already prove triggers a
+/// real TNS filter and measurably reduces the residual) must still round-trip
+/// end to end through the full encoder/decoder pipeline, not just through
+/// direct calls to the filter itself. This is what actually exercises TNS's
+/// bitstream wiring — the presence bit, the coefficient fields, and the
+/// decoder applying the inverse filter in the right place relative to
+/// dequantization — rather than the filter math in isolation.
+#[test]
+fn a_signal_with_spectral_envelope_still_round_trips_through_tns() {
+    let frames = 10;
+    let total = frames * FRAME_LEN;
+    // A raised-cosine envelope with a period of exactly one frame -- loud in
+    // the middle of each window, quiet at its edges -- gives real short-term
+    // spectral structure for TNS to shape without the pathological hard reset
+    // a sawtooth-style envelope would put at every frame boundary (which this
+    // minimal, block-switching-free FD path has no tool to handle well, and
+    // which would make a low SNR reflect that gap rather than anything about
+    // TNS). The envelope is continuous by construction: `cos` at `i % 1024`
+    // matches `cos` at `(i+1) % 1024` exactly at every boundary.
+    let pcm: Vec<f32> = (0..total)
+        .map(|i| {
+            let within_frame = (i % FRAME_LEN) as f32;
+            let phase = std::f32::consts::TAU * within_frame / FRAME_LEN as f32;
+            let envelope = 0.5 * (1.0 - phase.cos());
+            8000.0 * envelope * (within_frame * 0.31).sin()
+        })
+        .collect();
+
+    let mut encoder = UsacFdEncoder::new();
+    let mut decoder = UsacFdDecoder::new();
+    let mut decoded = vec![0.0f32; total];
+
+    for f in 0..frames {
+        let frame_pcm = &pcm[f * FRAME_LEN..(f + 1) * FRAME_LEN];
+        let block = encoder.encode_frame(frame_pcm);
+        let mut reader = BitReader::new(&block);
+        let out = decoder.decode_frame(&mut reader).expect("TNS-shaped frame must decode");
+        if f > 0 {
+            decoded[(f - 1) * FRAME_LEN..f * FRAME_LEN].copy_from_slice(&out);
+        }
+    }
+
+    let mut signal_energy = 0.0f64;
+    let mut error_energy = 0.0f64;
+    for i in 0..(frames - 1) * FRAME_LEN {
+        let e = (decoded[i] - pcm[i]) as f64;
+        error_energy += e * e;
+        signal_energy += (pcm[i] as f64).powi(2);
+    }
+    let snr_db = 10.0 * (signal_energy / error_energy.max(1e-9)).log10();
+    assert!(snr_db > 20.0, "reconstruction SNR too low with TNS in the loop: {snr_db:.1} dB");
+}
+
 #[test]
 fn silence_round_trips_exactly() {
     let frames = 4;

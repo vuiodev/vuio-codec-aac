@@ -4,10 +4,24 @@
 //! exercises the spectral arithmetic coder in
 //! [`crate::encoder::usac::arith`] end to end: FD core mode only, fixed
 //! 1024-sample long windows. What it deliberately does not cover — ACELP,
-//! TCX, USAC's complex-prediction stereo, TNS, MPEG Surround, and the
-//! general `UsacConfig()`/element-tree signalling a real stream needs — is
-//! separate, larger work; see the arithmetic-coder module's own doc for why
-//! that split makes sense.
+//! TCX, USAC's complex-prediction stereo, MPEG Surround, and the general
+//! `UsacConfig()`/element-tree signalling a real stream needs — is separate,
+//! larger work; see the arithmetic-coder module's own doc for why that split
+//! makes sense.
+//!
+//! # Temporal noise shaping
+//!
+//! Applied to the spectrum before the rate loop measures or quantizes
+//! anything, exactly where AAC-LC's own encoder runs it (see
+//! `src/encoder/engine.rs`'s identical ordering) — it is the shaped residual
+//! that has to get quantized and judged, not the raw spectrum. See
+//! [`crate::encoder::usac::tns`] for the filter itself; this module only
+//! decides where in the frame's header its side info sits.
+//!
+//! `tns_data_present` (1 bit) is transmitted explicitly rather than relying
+//! on a persistent per-element config flag the way the reference does — the
+//! same choice, and for the same reason, this module's noise-filling side
+//! info already makes (see that section below).
 //!
 //! # Reused, not reinvented
 //!
@@ -111,6 +125,7 @@ use crate::encoder::aac::psycho::{PsychoResult, PsychoacousticModel};
 use crate::encoder::aac::quant::{MAX_QUANT_MAGNITUDE, SF_OFFSET, quantize_band};
 use crate::encoder::aac::rate::{MAX_SCALEFACTOR, MAX_SCALEFACTOR_DELTA, MIN_SCALEFACTOR};
 use crate::encoder::usac::arith::encode_pairs;
+use crate::encoder::usac::tns::{self, TnsFilter, TnsSetup};
 use crate::tables::scalefactor::{MAX_SFB_LONG, compute_sfb_offsets};
 use crate::tables::sfb::SFB_48_1024;
 use crate::tables::usac_arith::Contexts;
@@ -142,13 +157,16 @@ pub const DEFAULT_BUDGET_BITS: usize = 12_000;
 struct Layout {
     sfb_offsets: [usize; MAX_SFB_LONG + 1],
     num_sfb: usize,
+    tns: TnsSetup,
 }
 
 impl Layout {
     fn new() -> Self {
         let mut sfb_offsets = [0usize; MAX_SFB_LONG + 1];
         let count = compute_sfb_offsets(SFB_48_1024, &mut sfb_offsets);
-        Self { sfb_offsets, num_sfb: count - 1 }
+        let num_sfb = count - 1;
+        let tns = TnsSetup::new(&sfb_offsets[..=num_sfb], num_sfb);
+        Self { sfb_offsets, num_sfb, tns }
     }
 }
 
@@ -231,6 +249,9 @@ impl UsacFdEncoder {
 
         let num_sfb = self.layout.num_sfb;
         let sfb_offsets = &self.layout.sfb_offsets[..=num_sfb];
+        let tns_filter =
+            tns::apply(&mut self.channel.spectrum, sfb_offsets, &self.layout.tns);
+
         let mut scalefactors = vec![SF_OFFSET; num_sfb];
         let mut quant = vec![0i32; FRAME_LEN];
         fit_scalefactors(
@@ -248,7 +269,15 @@ impl UsacFdEncoder {
             choose_noise_level(&self.channel.spectrum, sfb_offsets, num_sfb, &scalefactors, &quant);
 
         let mut writer = BitWriter::with_capacity(FRAME_LEN);
-        write_channel_header(&mut writer, &scalefactors, noise_level, noise_offset);
+        write_channel_header(
+            &mut writer,
+            &scalefactors,
+            noise_level,
+            noise_offset,
+            tns_filter.as_ref(),
+            &self.layout.tns,
+            num_sfb,
+        );
         let pairs = FRAME_LEN / 2;
         encode_pairs(&mut writer, &mut self.channel.contexts, &quant, pairs, pairs);
         writer.byte_align_zero();
@@ -327,6 +356,8 @@ impl UsacFdStereoEncoder {
         let num_sfb = self.layout.num_sfb;
         let sfb_offsets = &self.layout.sfb_offsets[..=num_sfb];
         for ch in &mut self.channels {
+            let tns_filter = tns::apply(&mut ch.spectrum, sfb_offsets, &self.layout.tns);
+
             let mut scalefactors = vec![SF_OFFSET; num_sfb];
             let mut quant = vec![0i32; FRAME_LEN];
             fit_scalefactors(
@@ -342,7 +373,15 @@ impl UsacFdStereoEncoder {
             );
             let (noise_level, noise_offset) =
                 choose_noise_level(&ch.spectrum, sfb_offsets, num_sfb, &scalefactors, &quant);
-            write_channel_header(&mut writer, &scalefactors, noise_level, noise_offset);
+            write_channel_header(
+                &mut writer,
+                &scalefactors,
+                noise_level,
+                noise_offset,
+                tns_filter.as_ref(),
+                &self.layout.tns,
+                num_sfb,
+            );
             let pairs = FRAME_LEN / 2;
             encode_pairs(&mut writer, &mut ch.contexts, &quant, pairs, pairs);
         }
@@ -417,16 +456,20 @@ fn write_scale_factor_data(writer: &mut BitWriter, scalefactors: &[i32]) {
 }
 
 /// Write one channel's real `FDChannelStream()` header: `global_gain` (8
-/// bits), `noise_level` (3 bits), `noise_offset` (5 bits), then one
-/// Huffman-coded scalefactor delta per remaining band — the exact order
-/// [`crate::decoder::usac::fd`]'s `read_channel_header` reads back (see this
-/// module's noise-filling docs for why `noise_level`/`noise_offset` sit
-/// here).
+/// bits), `noise_level` (3 bits), `noise_offset` (5 bits), one Huffman-coded
+/// scalefactor delta per remaining band, then the TNS side info — the exact
+/// order [`crate::decoder::usac::fd`]'s `read_channel_header` reads back
+/// (see this module's noise-filling and TNS docs for why each field sits
+/// where it does).
+#[allow(clippy::too_many_arguments)]
 fn write_channel_header(
     writer: &mut BitWriter,
     scalefactors: &[i32],
     noise_level: i32,
     noise_offset: i32,
+    tns_filter: Option<&TnsFilter>,
+    tns_setup: &TnsSetup,
+    num_sfb: usize,
 ) {
     writer.write_u8(scalefactors[0].clamp(0, 255) as u8, 8);
     writer.write_u8(noise_level as u8, 3);
@@ -435,6 +478,35 @@ fn write_channel_header(
     for &sf in &scalefactors[1..] {
         write_scalefactor_delta(writer, sf - previous);
         previous = sf;
+    }
+    write_tns_data(writer, tns_filter, tns_setup, num_sfb);
+}
+
+/// Write `tns_data_present` (1 bit) and, when set, the filter's side info:
+/// a coefficient-resolution bit, the (purely informational — see
+/// [`TnsSetup::length_field`]) `length` field, `order` (4 bits, `order` is
+/// capped at [`tns::ORDER`] which fits exactly), and — only when `order` is
+/// nonzero — `direction` and `coef_compress` (both always `0` on this
+/// long-window-only path) followed by `order` raw 4-bit two's-complement
+/// coefficient indices, the same encoding
+/// [`crate::encoder::engine`]'s AAC-LC `write_tns_data` uses for its own
+/// coefficients.
+fn write_tns_data(writer: &mut BitWriter, filter: Option<&TnsFilter>, setup: &TnsSetup, num_sfb: usize) {
+    let Some(filter) = filter else {
+        writer.write_bit(false);
+        return;
+    };
+    writer.write_bit(true);
+    writer.write_bit(true); // coef_res_bit: coef_res(4) - DEF_TNS_RES_OFFSET(3) = 1
+    writer.write_u8(setup.length_field(num_sfb), 6);
+    writer.write_u8(filter.order as u8, 4);
+    if filter.order > 0 {
+        writer.write_bit(false); // direction
+        writer.write_bit(false); // coef_compress
+        let mask = (1u32 << tns::COEF_RES_BITS) - 1;
+        for i in 0..filter.order {
+            writer.write_u32(filter.coef[i] as u32 & mask, tns::COEF_RES_BITS as usize);
+        }
     }
 }
 

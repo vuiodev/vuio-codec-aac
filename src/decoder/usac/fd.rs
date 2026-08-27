@@ -30,6 +30,22 @@
 //! [`crate::encoder::usac::fd`]'s noise-filling docs for why the encoder
 //! here always transmits exactly that value.
 //!
+//! # Temporal noise shaping
+//!
+//! Inverted after dequantization but *before* undoing mid/side (for the
+//! stereo path) — the exact reverse of the encoder's order, which applies
+//! TNS after the mid/side decision has already turned the two spectra into
+//! mid/side. See [`crate::encoder::usac::tns`] for the filter itself and why
+//! its coefficient tables and step-up recursion are shared with classic
+//! AAC-LC's TNS; this decoder reuses [`crate::decoder::aac::tns::ar_filter`]
+//! directly rather than a second synthesis-filter implementation.
+//!
+//! `tns_data_present`, the coefficient-resolution bit, `length` and `order`
+//! are read back in the exact order `crate::encoder::usac::fd`'s
+//! `write_tns_data` writes them; `length` is parsed and discarded rather than
+//! acted on, since [`crate::encoder::usac::tns::filter_band_range`] gives
+//! both sides the same answer without either transmitting it.
+//!
 //! # A decode-side bug the per-band rate loop surfaced
 //!
 //! The single-scalefactor-per-frame version of this decoder accumulated
@@ -45,9 +61,11 @@
 
 use crate::bitstream::BitReader;
 use crate::decoder::aac::huffman::decode_scalefactor_delta;
-use crate::decoder::aac::ics::SF_OFFSET;
+use crate::decoder::aac::ics::{MAX_TNS_ORDER, SF_OFFSET};
+use crate::decoder::aac::tns::{TNS_PARCOR_4, ar_filter, parcor_to_lpc};
 use crate::decoder::usac::arith::{decode_pairs, dequantize};
 use crate::dsp::filterbank::Filterbank;
+use crate::encoder::usac::tns::{self, TnsFilter};
 use crate::error::Result;
 use crate::tables::scalefactor::{MAX_SFB_LONG, compute_sfb_offsets};
 use crate::tables::sfb::SFB_48_1024;
@@ -120,11 +138,12 @@ struct ChannelHeader {
     noise_level: i32,
     noise_offset: i32,
     scalefactors: Vec<i32>,
+    tns: Option<TnsFilter>,
 }
 
 /// Read one channel's header: `global_gain` (8 bits), `noise_level` (3
-/// bits), `noise_offset` (5 bits), then one Huffman-coded scalefactor delta
-/// per remaining band.
+/// bits), `noise_offset` (5 bits), one Huffman-coded scalefactor delta per
+/// remaining band, then the TNS side info.
 fn read_channel_header(reader: &mut BitReader, num_sfb: usize) -> Result<ChannelHeader> {
     let mut scalefactors = vec![0i32; num_sfb];
     scalefactors[0] = reader.read_u8(8)? as i32;
@@ -133,7 +152,65 @@ fn read_channel_header(reader: &mut BitReader, num_sfb: usize) -> Result<Channel
     for b in 1..num_sfb {
         scalefactors[b] = scalefactors[b - 1] + decode_scalefactor_delta(reader)?;
     }
-    Ok(ChannelHeader { noise_level, noise_offset, scalefactors })
+    let tns = read_tns_data(reader)?;
+    Ok(ChannelHeader { noise_level, noise_offset, scalefactors, tns })
+}
+
+/// Read `tns_data_present` (1 bit) and, when set, the filter's side info —
+/// the exact inverse of `crate::encoder::usac::fd`'s `write_tns_data`. The
+/// coefficient-resolution bit and `length` field are consumed but not acted
+/// on: this path only ever transmits 4-bit-resolution coefficients, and the
+/// band range the filter covers is a fixed function of `num_sfb` (see
+/// [`tns::filter_band_range`]), not something either side needs to read back.
+fn read_tns_data(reader: &mut BitReader) -> Result<Option<TnsFilter>> {
+    if !reader.read_bit()? {
+        return Ok(None);
+    }
+    let _coef_res_bit = reader.read_bit()?;
+    let _length = reader.read_u8(6)?;
+    let order = reader.read_u8(4)? as usize;
+
+    let mut coef = [0i8; MAX_TNS_ORDER];
+    if order > 0 {
+        let _direction = reader.read_bit()?;
+        let _coef_compress = reader.read_bit()?;
+        let width = tns::COEF_RES_BITS as usize;
+        let shift = 32 - width;
+        for c in coef.iter_mut().take(order) {
+            let raw = reader.read_u32(width)? as i32;
+            // Sign-extend from `width` bits, the same trick AAC-LC's own
+            // TNS parser uses for its own (differently-sized) coefficients.
+            *c = ((raw << shift) >> shift) as i8;
+        }
+    }
+    Ok(Some(TnsFilter { order, coef }))
+}
+
+/// Undo TNS on one channel's dequantized spectrum in place: resolve the
+/// transmitted reflection-coefficient indices back through
+/// [`TNS_PARCOR_4`] (the reference decoder's `ixheaacd_tns_dec_coef_usac`
+/// indexes the same table the same way), convert to direct-form LPC, and run
+/// the all-pole synthesis filter over the same band range
+/// [`crate::encoder::usac::tns::apply`] filtered — a no-op when no filter was
+/// transmitted.
+fn invert_tns(spectral: &mut [f32], sfb_offsets: &[usize], num_sfb: usize, filter: &TnsFilter) {
+    if filter.order == 0 {
+        return;
+    }
+    let bias = (TNS_PARCOR_4.len() / 2) as i32;
+    let mut quantized = [0.0f32; MAX_TNS_ORDER];
+    for i in 0..filter.order {
+        quantized[i] = TNS_PARCOR_4[(filter.coef[i] as i32 + bias) as usize];
+    }
+    let mut lpc = [0.0f32; MAX_TNS_ORDER + 1];
+    parcor_to_lpc(&quantized[..filter.order], &mut lpc);
+
+    let (start_band, stop_band) = tns::filter_band_range(num_sfb);
+    let lo = sfb_offsets[start_band];
+    let hi = sfb_offsets[stop_band].min(spectral.len());
+    if hi > lo {
+        ar_filter(&mut spectral[lo..hi], &lpc, filter.order, false);
+    }
 }
 
 /// Dequantize one channel's coded magnitudes band by band, each with its own
@@ -175,6 +252,9 @@ fn dequantize_channel(
     }
     for (s, &c) in spectral.iter_mut().zip(coef.iter()) {
         *s = c as f32 / ARITH_FIXED_POINT_SHIFT;
+    }
+    if let Some(filter) = &header.tns {
+        invert_tns(spectral, sfb_offsets, num_sfb, filter);
     }
 }
 
@@ -352,7 +432,7 @@ mod tests {
 
         let mut scalefactors = vec![SF_OFFSET; num_sfb];
         scalefactors[sfb] = SF_OFFSET + 40;
-        let header = ChannelHeader { noise_level: 5, noise_offset: 16, scalefactors };
+        let header = ChannelHeader { noise_level: 5, noise_offset: 16, scalefactors, tns: None };
 
         let mut spectral = vec![0.0f32; FRAME_LEN];
         let mut seed = 7u32;
@@ -373,7 +453,7 @@ mod tests {
         let num_sfb = layout.num_sfb;
         let quant = vec![0i32; FRAME_LEN];
         let scalefactors = vec![SF_OFFSET; num_sfb];
-        let header = ChannelHeader { noise_level: 0, noise_offset: 0, scalefactors };
+        let header = ChannelHeader { noise_level: 0, noise_offset: 0, scalefactors, tns: None };
 
         let mut spectral = vec![0.0f32; FRAME_LEN];
         let mut seed = 7u32;
@@ -403,7 +483,7 @@ mod tests {
         let quant = vec![0i32; FRAME_LEN];
         let mut scalefactors = vec![SF_OFFSET; num_sfb];
         scalefactors[low_sfb] = SF_OFFSET + 40;
-        let header = ChannelHeader { noise_level: 7, noise_offset: 16, scalefactors };
+        let header = ChannelHeader { noise_level: 7, noise_offset: 16, scalefactors, tns: None };
 
         let mut spectral = vec![0.0f32; FRAME_LEN];
         let mut seed = 7u32;
