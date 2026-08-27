@@ -283,6 +283,9 @@ impl Decoder {
 
         if self.sbr_active {
             self.apply_band_replication()?;
+            // Parametric stereo may have widened the frame past what the core
+            // decoded, so the channel count is only final once it has run.
+            self.active_channels = self.replicated_channels().clamp(1, MAX_CHANNELS);
         }
 
         let frame_len = self.frame_length();
@@ -508,6 +511,20 @@ impl Decoder {
         }
     }
 
+    /// Output channels the elements of the last frame add up to.
+    ///
+    /// Parametric stereo turns a single-channel element into two, so this can
+    /// exceed the number of channels the core decoded.
+    fn replicated_channels(&self) -> usize {
+        self.elements
+            .iter()
+            .enumerate()
+            .map(|(index, &(_, count))| {
+                self.sbr.get(index).map_or(count, |sbr| sbr.output_channels().max(count))
+            })
+            .sum()
+    }
+
     /// Run the replication chain for every channel of every element that has one.
     ///
     /// Elements with no replicator still have their sample rate doubled, or the
@@ -516,7 +533,8 @@ impl Decoder {
         let core_len = self.config.frame_length.samples();
         let out_len = core_len * 2;
 
-        for ch in self.channels.iter_mut().take(self.active_channels) {
+        let produced = self.replicated_channels().max(self.active_channels);
+        for ch in self.channels.iter_mut().take(produced.min(MAX_CHANNELS)) {
             if ch.sbr_pcm.len() != out_len {
                 ch.sbr_pcm = vec![0.0; out_len];
             }
@@ -536,12 +554,37 @@ impl Decoder {
         // core is moved into a scratch buffer for the call and moved back after.
         let elements = std::mem::take(&mut self.elements);
         let mut result = Ok(());
+        let mut out_channel = 0usize;
         for (index, &(first, count)) in elements.iter().enumerate() {
+            // A parametric stereo element reads one coded channel and writes two.
+            if self.sbr.get(index).is_some_and(SbrDecoder::parametric_stereo)
+                && out_channel + 1 < MAX_CHANNELS
+            {
+                std::mem::swap(&mut self.sbr_scratch, &mut self.channels[first].pcm);
+                let (head, tail) = self.channels.split_at_mut(out_channel + 1);
+                let mut left = std::mem::take(&mut head[out_channel].sbr_pcm);
+                let mut right = std::mem::take(&mut tail[0].sbr_pcm);
+                if let Err(e) = self.sbr[index].process_parametric(
+                    &self.sbr_scratch,
+                    &mut left,
+                    &mut right,
+                ) && result.is_ok()
+                {
+                    result = Err(e);
+                }
+                self.channels[out_channel].sbr_pcm = left;
+                self.channels[out_channel + 1].sbr_pcm = right;
+                std::mem::swap(&mut self.sbr_scratch, &mut self.channels[first].pcm);
+                out_channel += 2;
+                continue;
+            }
+
             for offset in 0..count {
                 let channel = first + offset;
                 if channel >= self.active_channels {
                     continue;
                 }
+                out_channel = out_channel.max(channel + 1);
                 std::mem::swap(&mut self.sbr_scratch, &mut self.channels[channel].pcm);
                 let mut produced = std::mem::take(&mut self.channels[channel].sbr_pcm);
 

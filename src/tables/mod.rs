@@ -10,6 +10,7 @@
 pub mod dequant;
 pub mod huffman;
 pub mod huffman_rom;
+pub mod ps;
 pub mod qmf;
 pub mod sbr;
 pub mod scalefactor;

@@ -3,8 +3,17 @@
 //! Extracts Inter-channel Intensity Differences (IID) and Inter-channel Coherence (ICC)
 //! from a stereo pair and produces a mono downmix (ISO/IEC 14496-3 Part 3 Subpart 8).
 
-use crate::decoder::ps::PsFrameData;
 use crate::error::Result;
+
+/// Parameters one frame of parametric stereo carries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PsFrameData {
+    pub enable_iid: bool,
+    pub enable_icc: bool,
+    pub enable_ipd: bool,
+    pub iid_indices: Vec<i8>,
+    pub icc_indices: Vec<u8>,
+}
 
 /// PS Encoder instance.
 pub struct PsEncoder;

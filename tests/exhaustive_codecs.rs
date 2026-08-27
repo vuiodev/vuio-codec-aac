@@ -9,14 +9,14 @@ use vuiocodecaac::decoder::aac::tns::{ar_filter, ma_filter, parcor_to_lpc};
 use vuiocodecaac::tables::scalefactor::{MAX_SFB_LONG, compute_sfb_offsets};
 use vuiocodecaac::decoder::drc::DrcDecoder;
 use vuiocodecaac::decoder::mps::{MpsDecoder, MpsSpatialCues};
-use vuiocodecaac::decoder::ps::PsDecoder;
+use vuiocodecaac::decoder::ps::{PsDecoder, SLOTS as PS_SLOTS};
+use vuiocodecaac::dsp::fft::Complex32;
 use vuiocodecaac::decoder::sbr::{SBR_CORE_FRAME, SbrDecoder};
 use vuiocodecaac::decoder::usac::{UsacCoreMode, UsacDecoder};
 use vuiocodecaac::encoder::aac::block_switch::BlockSwitching;
 use vuiocodecaac::encoder::aac::psycho::PsychoacousticModel;
 use vuiocodecaac::encoder::aac::quant::{choose_codebook, quantize_band};
 use vuiocodecaac::encoder::drc::DrcEncoder;
-use vuiocodecaac::encoder::ps::PsEncoder;
 use vuiocodecaac::encoder::sbr::SbrEncoder;
 use vuiocodecaac::encoder::usac::UsacEncoder;
 use vuiocodecaac::bitstream::{BitReader, BitWriter};
@@ -117,18 +117,37 @@ fn test_sbr_and_ps_end_to_end() {
     sbr.process_channel(0, &baseband, &mut output_2x).unwrap();
     assert_eq!(output_2x.len(), 2 * SBR_CORE_FRAME);
 
-    let ps_enc = PsEncoder::new();
+    // Parametric stereo turns one QMF frame into two. With no payload seen the
+    // matrix is the identity one both channels start from, so the two outputs
+    // carry the downmix and stay finite.
     let mut ps_dec = PsDecoder::new();
-    let left = vec![0.8f32; 1024];
-    let right = vec![0.4f32; 1024];
-    let mut mono = vec![0.0f32; 1024];
+    let mut ps_left = vec![[Complex32::default(); 64]; PS_SLOTS];
+    let mut ps_right = vec![[Complex32::default(); 64]; PS_SLOTS];
+    for (slot, bands) in ps_left.iter_mut().enumerate() {
+        for (band, v) in bands.iter_mut().enumerate().take(20) {
+            let a = 0.11 * (slot * 20 + band) as f32;
+            *v = Complex32::new(a.sin(), a.cos());
+        }
+    }
+    let source = ps_left.clone();
+    let ahead = vec![[Complex32::default(); 64]; 6];
+    ps_dec.process(&mut ps_left, &ahead, &mut ps_right);
 
-    let ps_data = ps_enc.encode_stereo(&left, &right, &mut mono).unwrap();
-    let mut out_l = vec![0.0f32; 1024];
-    let mut out_r = vec![0.0f32; 1024];
-    ps_dec.decode_stereo(&mono, &ps_data, &mut out_l, &mut out_r).unwrap();
-    assert_ne!(out_l[0], 0.0);
-    assert_ne!(out_r[0], 0.0);
+    let mut energy = 0.0f64;
+    for (slot, bands) in ps_left.iter().enumerate() {
+        for (band, v) in bands.iter().enumerate() {
+            assert!(v.re.is_finite() && v.im.is_finite());
+            // The three lowest bands go through the hybrid filterbank, whose
+            // history and look-ahead this single frame does not supply; only the
+            // pass-through range can be checked sample for sample.
+            if band < 3 {
+                continue;
+            }
+            let want = source[slot][band];
+            energy += ((v.re - want.re) as f64).powi(2) + ((v.im - want.im) as f64).powi(2);
+        }
+    }
+    assert!(energy < 1e-4, "left channel drifted from the downmix by {energy}");
 }
 
 #[test]

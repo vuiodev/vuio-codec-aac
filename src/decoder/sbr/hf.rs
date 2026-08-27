@@ -32,6 +32,13 @@ pub const SLOTS_PER_FRAME: usize = 32;
 pub const HF_GEN: usize = 8;
 /// Where in the grid the envelope time base and the output window begin.
 pub const HF_ADJ: usize = 2;
+/// Slots past the output window the grid can still be read at.
+///
+/// They hold the raw analysis rather than an envelope-adjusted reconstruction, so
+/// they are only meaningful below the replication crossover, where the grid carries
+/// the core signal untouched. Parametric stereo's hybrid filterbank reads exactly
+/// that range, and exactly those subbands.
+pub const LOOKAHEAD: usize = X_SLOTS - HF_ADJ - SLOTS_PER_FRAME;
 /// Subbands the grid spans.
 pub const GRID_BANDS: usize = 64;
 
@@ -148,8 +155,11 @@ impl HfState {
     }
 
     /// Read out the output window as `slot`-major subband samples.
+    ///
+    /// Slots up to `SLOTS_PER_FRAME + LOOKAHEAD` may be read; see [`LOOKAHEAD`] for
+    /// what the ones past the window hold.
     pub fn output_slot(&self, slot: usize, out: &mut [Complex32]) {
-        debug_assert!(slot < SLOTS_PER_FRAME);
+        debug_assert!(slot < SLOTS_PER_FRAME + LOOKAHEAD);
         for (k, dst) in out.iter_mut().enumerate() {
             *dst = self.x[k * X_SLOTS + HF_ADJ + slot];
         }

@@ -29,6 +29,7 @@ pub mod hf;
 pub mod header;
 
 use crate::bitstream::BitReader;
+use crate::decoder::ps::{PsDecoder, QmfSlot};
 use crate::dsp::fft::Complex32;
 use crate::dsp::qmf::{QmfAnalysis, QmfSynthesis, SynthesisWidth};
 use crate::error::{DecodeError, Result};
@@ -104,12 +105,40 @@ pub struct SbrDecoder {
     downsampled: bool,
     /// Set until a header has been seen and a layout derived.
     ready: bool,
+    /// Parametric stereo, present once an extension field has carried a payload.
+    ///
+    /// It turns a single-channel element into a stereo pair, so it also owns the
+    /// synthesis bank the second channel needs.
+    ps: Option<Box<ParametricStereo>>,
+}
+
+/// The parametric stereo decoder and the buffers its extra channel needs.
+struct ParametricStereo {
+    decoder: PsDecoder,
+    /// Synthesis bank for the channel parametric stereo invents.
+    synthesis: QmfSynthesis,
+    left: Vec<QmfSlot>,
+    right: Vec<QmfSlot>,
+    /// The slots past the frame the hybrid filterbank reads.
+    ahead: Vec<QmfSlot>,
+}
+
+impl ParametricStereo {
+    fn new(width: SynthesisWidth) -> Self {
+        Self {
+            decoder: PsDecoder::new(),
+            synthesis: QmfSynthesis::new(width),
+            left: vec![[Complex32::default(); GRID_BANDS]; SLOTS_PER_FRAME],
+            right: vec![[Complex32::default(); GRID_BANDS]; SLOTS_PER_FRAME],
+            ahead: vec![[Complex32::default(); GRID_BANDS]; hf::LOOKAHEAD],
+        }
+    }
 }
 
 impl SbrDecoder {
     /// Create a decoder for `channels` channels whose core runs at `core_rate_hz`.
     pub fn new(channels: usize, core_rate_hz: u32, downsampled: bool) -> Self {
-        let width = if downsampled { SynthesisWidth::Downsampled } else { SynthesisWidth::Full };
+        let width = synthesis_width(downsampled);
         Self {
             header: None,
             layout: BandLayout::default(),
@@ -117,7 +146,20 @@ impl SbrDecoder {
             output_rate_hz: core_rate_hz.saturating_mul(2),
             downsampled,
             ready: false,
+            ps: None,
         }
+    }
+
+    /// Channels this element produces, which parametric stereo doubles.
+    #[inline]
+    pub fn output_channels(&self) -> usize {
+        if self.ps.is_some() { 2 } else { self.channels.len() }
+    }
+
+    /// Whether parametric stereo is reconstructing a second channel.
+    #[inline]
+    pub fn parametric_stereo(&self) -> bool {
+        self.ps.is_some()
     }
 
     /// Samples per channel this decoder produces per core frame.
@@ -142,6 +184,10 @@ impl SbrDecoder {
     pub fn reset(&mut self) {
         for ch in &mut self.channels {
             ch.reset();
+        }
+        if let Some(ps) = self.ps.as_mut() {
+            ps.decoder.reset();
+            ps.synthesis.reset();
         }
     }
 
@@ -234,8 +280,12 @@ impl SbrDecoder {
 
     /// Parse `sbr_single_channel_element()`.
     fn decode_single(&mut self, reader: &mut BitReader) -> Result<()> {
-        let header = self.header.clone().expect("ready implies a header");
-        let layout = std::mem::take(&mut self.layout);
+        // Splitting the borrow keeps `self.layout` in place: an early `?` used to
+        // leave a taken-out layout behind as an empty default, which the next frame
+        // then indexed as though it were valid.
+        let Self { header, layout, channels, ps, downsampled, .. } = self;
+        let width = synthesis_width(*downsampled);
+        let header = header.clone().expect("ready implies a header");
 
         // `bs_data_extra` gates a reserved field that no profile defines.
         if reader.read_bit()? {
@@ -247,10 +297,10 @@ impl SbrDecoder {
         let (df_env, df_noise) = data::read_direction_flags(reader, &grid)?;
         let invf = data::read_invf(reader, layout.noise_band_count())?;
 
-        let ch = &mut self.channels[0];
+        let ch = &mut channels[0];
         let envelope_q = data::read_envelopes(
             reader,
-            &layout,
+            layout,
             &grid,
             amp_res,
             false,
@@ -258,14 +308,14 @@ impl SbrDecoder {
             &mut ch.history,
         )?;
         let noise_q =
-            data::read_noise_floors(reader, &layout, amp_res, false, &df_noise, &mut ch.history)?;
+            data::read_noise_floors(reader, layout, amp_res, false, &df_noise, &mut ch.history)?;
 
         let add_harmonic = if reader.read_bit()? {
             data::read_added_sinusoids(reader, layout.sfb_count(true))?
         } else {
             vec![false; layout.sfb_count(true)]
         };
-        skip_extended_data(reader)?;
+        read_extended_data(reader, ps, width)?;
 
         ch.data = SbrChannelData {
             grid,
@@ -280,7 +330,6 @@ impl SbrDecoder {
         data::dequantize(&mut ch.data);
         ch.have_data = true;
 
-        self.layout = layout;
         Ok(())
     }
 
@@ -292,8 +341,9 @@ impl SbrDecoder {
             )
             .into());
         }
-        let header = self.header.clone().expect("ready implies a header");
-        let layout = std::mem::take(&mut self.layout);
+        let Self { header, layout, channels, ps, downsampled, .. } = self;
+        let width = synthesis_width(*downsampled);
+        let header = header.clone().expect("ready implies a header");
         let high_bands = layout.sfb_count(true);
 
         // `bs_data_extra` gates two reserved fields, one per channel.
@@ -303,7 +353,7 @@ impl SbrDecoder {
         }
         let coupled = reader.read_bit()?;
 
-        let (left, right) = self.channels.split_at_mut(1);
+        let (left, right) = channels.split_at_mut(1);
         let left = &mut left[0];
         let right = &mut right[0];
 
@@ -400,7 +450,7 @@ impl SbrDecoder {
         if reader.read_bit()? {
             right_data.add_harmonic = data::read_added_sinusoids(reader, high_bands)?;
         }
-        skip_extended_data(reader)?;
+        read_extended_data(reader, ps, width)?;
 
         if coupled {
             data::dequantize_coupled(&mut left_data, &mut right_data);
@@ -414,7 +464,6 @@ impl SbrDecoder {
         left.have_data = true;
         right.have_data = true;
 
-        self.layout = layout;
         Ok(())
     }
 
@@ -425,17 +474,79 @@ impl SbrDecoder {
     /// still filtered through the QMF pair, so that the output keeps the same
     /// delay and the core signal is not interrupted.
     pub fn process_channel(&mut self, channel: usize, core: &[f32], out: &mut [f32]) -> Result<()> {
+        self.check_buffers(channel, core, out)?;
+        self.reconstruct(channel, core);
+
+        let ch = &mut self.channels[channel];
+        let width = ch.synthesis.bands();
+        let mut slot_bands = [Complex32::default(); GRID_BANDS];
+        for slot in 0..SLOTS_PER_FRAME {
+            ch.hf.output_slot(slot, &mut slot_bands);
+            ch.synthesis
+                .process_slot(&slot_bands[..width], &mut out[slot * width..(slot + 1) * width]);
+        }
+        Ok(())
+    }
+
+    /// Run the reconstruction for a parametric stereo element, writing both channels.
+    ///
+    /// The element carries one coded channel; the second is invented from the
+    /// transmitted stereo image. Both come out six QMF slots later than
+    /// [`Self::process_channel`] would deliver the same core signal, which is what
+    /// the hybrid filterbank costs.
+    pub fn process_parametric(
+        &mut self,
+        core: &[f32],
+        left: &mut [f32],
+        right: &mut [f32],
+    ) -> Result<()> {
+        self.check_buffers(0, core, left)?;
+        self.check_buffers(0, core, right)?;
+        let Some(mut ps) = self.ps.take() else {
+            return Err(DecodeError::PsError("no parametric stereo payload for this element".into())
+                .into());
+        };
+
+        self.reconstruct(0, core);
+
+        let ch = &mut self.channels[0];
+        for (slot, bands) in ps.left.iter_mut().enumerate() {
+            ch.hf.output_slot(slot, bands);
+        }
+        for (offset, bands) in ps.ahead.iter_mut().enumerate() {
+            ch.hf.output_slot(SLOTS_PER_FRAME + offset, bands);
+        }
+        ps.decoder.process(&mut ps.left, &ps.ahead, &mut ps.right);
+
+        let width = ch.synthesis.bands();
+        for slot in 0..SLOTS_PER_FRAME {
+            let span = slot * width..(slot + 1) * width;
+            ch.synthesis.process_slot(&ps.left[slot][..width], &mut left[span.clone()]);
+            ps.synthesis.process_slot(&ps.right[slot][..width], &mut right[span]);
+        }
+
+        self.ps = Some(ps);
+        Ok(())
+    }
+
+    /// Reject a call whose buffers are not the sizes the chain needs.
+    fn check_buffers(&self, channel: usize, core: &[f32], out: &[f32]) -> Result<()> {
         if channel >= self.channels.len() {
             return Err(DecodeError::CorruptedFrame("SBR channel index out of range".into()).into());
         }
         if core.len() < SBR_CORE_FRAME || out.len() < self.output_frame_len() {
-            return Err(DecodeError::CorruptedFrame("SBR frame buffers are the wrong size".into())
-                .into());
+            return Err(
+                DecodeError::CorruptedFrame("SBR frame buffers are the wrong size".into()).into()
+            );
         }
+        Ok(())
+    }
 
-        let layout = std::mem::take(&mut self.layout);
-        let header = self.header.clone();
-        let ch = &mut self.channels[channel];
+    /// Analyse one core frame and fill the high band from the transmitted envelope.
+    fn reconstruct(&mut self, channel: usize, core: &[f32]) {
+        let Self { header, layout, channels, ready, .. } = self;
+        let ready = *ready;
+        let ch = &mut channels[channel];
 
         ch.hf.advance_frame();
         let mut bands = [Complex32::default(); 32];
@@ -444,45 +555,53 @@ impl SbrDecoder {
             ch.hf.store_slot(slot, &bands);
         }
 
-        if ch.have_data && self.ready {
-            if std::env::var_os("AAC_TRACE_SBR").is_some() && channel == 0 {
+        if ch.have_data && ready {
+            if channel == 0 && std::env::var_os("AAC_TRACE_SBR").is_some() {
+                let d = &ch.data;
                 eprintln!(
                     "  frame: class {:?} env {} borders {:?} noise_borders {:?} res {:?} trans {:?} invf {:?}",
-                    ch.data.grid.class,
-                    ch.data.grid.envelopes(),
-                    ch.data.grid.borders,
-                    ch.data.grid.noise_borders,
-                    ch.data.grid.high_res,
-                    ch.data.grid.transient_envelope,
-                    ch.data.invf
+                    d.grid.class,
+                    d.grid.envelopes(),
+                    d.grid.borders,
+                    d.grid.noise_borders,
+                    d.grid.high_res,
+                    d.grid.transient_envelope,
+                    d.invf
                 );
-                eprintln!("    env {:?}", ch.data.envelope);
-                eprintln!("    noise {:?}", ch.data.noise);
-                eprintln!("    sines {:?}", ch.data.add_harmonic);
+                eprintln!("    env {:?}", d.envelope);
+                eprintln!("    noise {:?}", d.noise);
+                eprintln!("    sines {:?}", d.add_harmonic);
             }
             let header = header.as_ref().expect("ready implies a header");
-            hf::generate(&mut ch.hf, &layout, &ch.data);
-            hf::adjust(&mut ch.hf, &layout, header, &ch.data);
+            hf::generate(&mut ch.hf, layout, &ch.data);
+            hf::adjust(&mut ch.hf, layout, header, &ch.data);
         }
-
-        let width = ch.synthesis.bands();
-        let mut slot_bands = [Complex32::default(); GRID_BANDS];
-        for slot in 0..SLOTS_PER_FRAME {
-            ch.hf.output_slot(slot, &mut slot_bands);
-            ch.synthesis
-                .process_slot(&slot_bands[..width], &mut out[slot * width..(slot + 1) * width]);
-        }
-
-        self.layout = layout;
-        Ok(())
     }
 }
 
-/// Step over `bs_extended_data`, whose payload this decoder does not use.
+/// The synthesis bank width core-rate or doubled output calls for.
+#[inline]
+const fn synthesis_width(downsampled: bool) -> SynthesisWidth {
+    if downsampled { SynthesisWidth::Downsampled } else { SynthesisWidth::Full }
+}
+
+/// Extension field identifiers `bs_extended_data` can carry.
+mod extension_id {
+    /// Parametric stereo, the only one this decoder acts on.
+    pub const PS: u8 = 2;
+}
+
+/// Read `bs_extended_data`, decoding any parametric stereo payload it carries.
 ///
-/// Parametric stereo travels here; a decoder that wants it reads the payload
-/// before calling this.
-fn skip_extended_data(reader: &mut BitReader) -> Result<()> {
+/// The field is byte-counted and each extension inside it is length-implicit, so
+/// the reader is stepped to the declared end whatever was found: an extension this
+/// decoder does not know, or one that fails to parse, must not desynchronise the
+/// rest of the frame.
+fn read_extended_data(
+    reader: &mut BitReader,
+    ps: &mut Option<Box<ParametricStereo>>,
+    width: SynthesisWidth,
+) -> Result<()> {
     if !reader.read_bit()? {
         return Ok(());
     }
@@ -490,7 +609,33 @@ fn skip_extended_data(reader: &mut BitReader) -> Result<()> {
     if count == 15 {
         count += reader.read_u8(8)? as usize;
     }
-    reader.skip_bits(count * 8)?;
+    let payload_bits = count * 8;
+    if reader.bits_remaining() < payload_bits {
+        return Err(DecodeError::CorruptedFrame(
+            "SBR extension field runs past the end of the payload".into(),
+        )
+        .into());
+    }
+    let end = reader.bit_position() + payload_bits;
+
+    while end.saturating_sub(reader.bit_position()) > 7 {
+        let id = reader.read_u8(2)?;
+        if id != extension_id::PS {
+            break;
+        }
+        let stereo = ps.get_or_insert_with(|| Box::new(ParametricStereo::new(width)));
+        let room = end - reader.bit_position();
+        if stereo.decoder.parse(reader, room).is_err() {
+            // Keep the element rather than the payload: the downmix is still a
+            // perfectly good mono signal, and the previous frame's image holds.
+            break;
+        }
+    }
+
+    let position = reader.bit_position();
+    if position < end {
+        reader.skip_bits(end - position)?;
+    }
     Ok(())
 }
 
