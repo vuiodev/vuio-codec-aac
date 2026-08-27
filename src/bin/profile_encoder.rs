@@ -57,18 +57,22 @@ fn main() {
     
     // Benchmark psychoacoustic analyze
     let sfb_offsets: Vec<usize> = (0..=49).map(|i| (i * 21).min(n)).collect();
-    let psycho = vuiocodecaac::encoder::aac::psycho::PsychoacousticModel::new(49);
+    let mut psycho = vuiocodecaac::encoder::aac::psycho::PsychoacousticModel::new(
+        44100, 64000, &sfb_offsets, false,
+    );
+    let mut psycho_out = vuiocodecaac::encoder::aac::psycho::PsychoResult::default();
+    let sequence = vuiocodecaac::types::WindowSequence::OnlyLongSequence;
     for _ in 0..10 {
-        let _ = psycho.analyze(black_box(&spectrum), black_box(&sfb_offsets));
+        psycho.analyse(black_box(&spectrum), black_box(&sfb_offsets), sequence, &mut psycho_out);
     }
     let start = Instant::now();
     for _ in 0..iterations {
-        let r = psycho.analyze(black_box(&spectrum), black_box(&sfb_offsets));
-        black_box(r);
+        psycho.analyse(black_box(&spectrum), black_box(&sfb_offsets), sequence, &mut psycho_out);
+        black_box(psycho_out.perceptual_entropy);
     }
     let elapsed_psycho = start.elapsed();
     let psycho_us = elapsed_psycho.as_secs_f64() * 1e6 / iterations as f64;
-    println!("psycho.analyze:                {:>10.1} µs/call", psycho_us);
+    println!("psycho.analyse:                {:>10.1} µs/call", psycho_us);
     
     // Benchmark window application
     let window: Vec<f32> = (0..2*n).map(|i| {

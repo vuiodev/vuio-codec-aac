@@ -185,11 +185,15 @@ fn test_mps_usac_and_drc() {
 
 #[test]
 fn test_psychoacoustic_and_quantization() {
-    let psycho = PsychoacousticModel::new(49);
-    let spec = vec![0.5f32; 1024];
     let sfb_offsets: Vec<usize> = (0..=49).map(|i| (i * 1024) / 49).collect();
-    let result = psycho.analyze(&spec, &sfb_offsets);
-    assert_eq!(result.num_bands, 49);
+    let mut psycho = PsychoacousticModel::new(44100, 64000, &sfb_offsets, false);
+    let spec = vec![0.5f32; 1024];
+    let mut result = vuiocodecaac::encoder::aac::psycho::PsychoResult::default();
+    psycho.analyse(&spec, &sfb_offsets, vuiocodecaac::types::WindowSequence::OnlyLongSequence, &mut result);
+    assert_eq!(result.bands, 49);
+    for b in 0..result.bands {
+        assert!(result.threshold[b] > 0.0);
+    }
 
     // Quantize at unity scale, then confirm the rate estimator picks a codebook
     // that can actually represent the result.

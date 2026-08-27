@@ -6,12 +6,12 @@
 //!
 //! # Scope
 //!
-//! This encoder emits long windows with a sine shape and a flat quantization noise
-//! floor set by rate control alone. It produces conformant, decodable AAC-LC, but
-//! it does not yet use the tools that buy perceptual quality at a given bitrate:
-//! block switching for transients, mid/side stereo, TNS, or a masking model driving
-//! per-band scalefactors. Those are the difference between "correct" and
-//! "competitive", and they are not implemented here.
+//! This encoder emits long windows with a sine shape. A masking model
+//! ([`crate::encoder::aac::psycho`]) decides how much noise each band may carry, a
+//! rate loop ([`crate::encoder::aac::rate`]) turns that into per-band scalefactors
+//! that fit the frame's budget, and a stereo pair is coded mid/side wherever that
+//! is cheaper. Block switching for transients and temporal noise shaping are not
+//! wired in yet.
 
 use crate::bitstream::BitWriter;
 use crate::buffer::AudioBuffer;
@@ -19,9 +19,9 @@ use crate::dsp::fft::Complex32;
 use crate::dsp::mdct::MdctContext;
 use crate::dsp::window::generate_sine_window_f32;
 use crate::encoder::aac::huffman::write_scalefactor_delta;
-use crate::encoder::aac::quant::{
-    BandChoice, SF_OFFSET, choose_codebook, quantize_band, write_band,
-};
+use crate::encoder::aac::psycho::{PsychoResult, PsychoacousticModel};
+use crate::encoder::aac::quant::{SF_OFFSET, write_band};
+use crate::encoder::aac::rate::{Quantization, RateLoop};
 use crate::error::Result;
 use crate::syntax::adts::AdtsHeader;
 use crate::tables::scalefactor::{MAX_SFB_LONG, compute_sfb_offsets, get_sfb_table};
@@ -58,23 +58,29 @@ struct ChannelState {
     windowed: Vec<f32>,
     /// `n` spectral coefficients.
     spectrum: Vec<f32>,
-    /// Quantized coefficients.
-    quant: Vec<i32>,
-    /// Chosen codebook per band.
-    choices: Vec<BandChoice>,
-    /// Scalefactor per band.
-    scalefactors: Vec<i32>,
+    /// The masking model's view of this channel's frame.
+    psycho: PsychoResult,
+    /// What the rate loop settled on.
+    coded: Quantization,
+    /// The masking model, which carries pre-echo state between frames.
+    model: PsychoacousticModel,
 }
 
 impl ChannelState {
-    fn new(n: usize, bands: usize) -> Self {
+    fn new(
+        n: usize,
+        bands: usize,
+        sample_rate_hz: u32,
+        bitrate_per_channel: u32,
+        offsets: &[usize],
+    ) -> Self {
         Self {
             history: vec![0.0; n],
             windowed: vec![0.0; 2 * n],
             spectrum: vec![0.0; n],
-            quant: vec![0; n],
-            choices: vec![BandChoice::default(); bands],
-            scalefactors: vec![SF_OFFSET; bands],
+            psycho: PsychoResult::default(),
+            coded: Quantization::new(n, bands),
+            model: PsychoacousticModel::new(sample_rate_hz, bitrate_per_channel, offsets, false),
         }
     }
 }
@@ -96,6 +102,12 @@ pub struct Encoder {
     frame_count: u64,
     mdct_scratch: Vec<Complex32>,
     writer: BitWriter,
+    /// Scalefactor estimation and the bisection that fits the budget.
+    rate: RateLoop,
+    /// Bands coded mid/side, when the frame is a stereo pair.
+    ms_mask: Vec<bool>,
+    /// Whether any band of the current frame is coded mid/side.
+    ms_used: bool,
 }
 
 impl Encoder {
@@ -117,12 +129,24 @@ impl Encoder {
 
         let mdct = MdctContext::new(n);
         let scratch_len = mdct.scratch_len();
+        let config_rate = config.sampling_rate.hz();
+        let per_channel_bitrate = config.bitrate_bps / num_ch as u32;
 
         Ok(Self {
             config,
             mdct,
             window: generate_sine_window_f32(2 * n),
-            channels: (0..num_ch).map(|_| ChannelState::new(n, num_bands)).collect(),
+            channels: (0..num_ch)
+                .map(|_| {
+                    ChannelState::new(
+                        n,
+                        num_bands,
+                        config_rate,
+                        per_channel_bitrate,
+                        &sfb_offsets[..count],
+                    )
+                })
+                .collect(),
             sfb_offsets,
             num_bands,
             max_sfb,
@@ -130,6 +154,9 @@ impl Encoder {
             frame_count: 0,
             mdct_scratch: vec![Complex32::default(); scratch_len],
             writer: BitWriter::with_capacity(4096),
+            rate: RateLoop::new(n),
+            ms_mask: vec![false; num_bands],
+            ms_used: false,
         })
     }
 
@@ -149,6 +176,7 @@ impl Encoder {
     pub fn reset(&mut self) {
         for ch in self.channels.iter_mut() {
             ch.history.fill(0.0);
+            ch.model.reset();
         }
         self.frame_count = 0;
     }
@@ -176,98 +204,151 @@ impl Encoder {
             }
         }
 
-        // Reserve room for the element headers and the ADTS header itself.
-        let overhead_bits = 56 + num_ch * 24 + 3;
-        let budget = self.frame_bits.saturating_sub(overhead_bits) / num_ch.max(1);
-        for c in 0..num_ch {
-            self.fit_channel(c, budget);
+        self.ms_used = false;
+        if num_ch == 2 {
+            self.decide_mid_side();
         }
+        for c in 0..num_ch {
+            self.analyse_channel(c);
+        }
+        self.allocate_and_fit(num_ch);
 
         self.write_frame(num_ch)
     }
 
-    /// Choose a scalefactor for channel `c` that fits its share of the frame budget.
-    ///
-    /// Bisects on a single scalefactor applied to every band: raising it coarsens
-    /// the quantization monotonically, so cost is monotone in it and bisection is
-    /// well defined.
-    fn fit_channel(&mut self, c: usize, budget: usize) {
-        // Search the whole legal scalefactor range. Cost falls monotonically as the
-        // scalefactor rises, so bisection finds the smallest one that fits, which is
-        // the finest quantization the budget allows.
-        let mut lo = 0i32;
-        let mut hi = 255i32;
-        let mut best = 255i32;
-        let mut found = false;
-
-        while lo <= hi {
-            let mid = (lo + hi) / 2;
-            if self.cost_at(c, mid) <= budget {
-                best = mid;
-                found = true;
-                hi = mid - 1;
-            } else {
-                lo = mid + 1;
-            }
-        }
-
-        if !found {
-            // Even the coarsest quantization overspends; take it and let the frame
-            // run over rather than emitting nothing.
-            best = 255;
-        }
-
-        // Re-run at the chosen scalefactor so the quantized values and codebook
-        // choices left behind are the ones that will be written.
-        let bits = self.cost_at(c, best);
-        if std::env::var_os("AACENC_TRACE").is_some() {
-            let ch = &self.channels[c];
-            let peak_spec = ch.spectrum.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            let peak_q = ch.quant.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
-            let clamped = ch.quant.iter().filter(|v| v.unsigned_abs() >= 8191).count();
-            eprintln!(
-                "enc frame {} ch {c} sf {best} bits {bits}/{budget} peak_spec {peak_spec:.0} peak_q {peak_q} clamped {clamped}",
-                self.frame_count + 1
-            );
-        }
-        let ch = &mut self.channels[c];
-        ch.scalefactors[..self.num_bands].fill(best);
+    /// Bits the frame's payload may use, after the headers it has to carry.
+    fn payload_budget(&self, num_ch: usize) -> usize {
+        // ADTS header, element identifier and tag, the shared `ics_info`, the
+        // mid/side mask, one `global_gain` per channel, and the terminator.
+        let element = if num_ch >= 2 { 3 + 4 + 1 + 11 + 2 + self.max_sfb } else { 0 };
+        let per_channel = if num_ch >= 2 { 8 } else { 3 + 4 + 8 + 11 };
+        let overhead = 56 + 3 + element + per_channel * num_ch;
+        self.frame_bits.saturating_sub(overhead)
     }
 
-    /// Quantize channel `c` at `scalefactor` and return the payload bit cost.
+    /// Split the frame's budget between channels and quantize each to its share.
     ///
-    /// Leaves the quantized values and codebook choices in place, so the caller can
-    /// re-run it at the chosen scalefactor before writing.
-    fn cost_at(&mut self, c: usize, scalefactor: i32) -> usize {
-        let max_sfb = self.max_sfb;
-        let ch = &mut self.channels[c];
+    /// An even split wastes bits whenever the channels differ in difficulty, which
+    /// after a mid/side decision they almost always do: a side channel carrying
+    /// nothing would keep half the frame to itself. Shares therefore follow each
+    /// channel's perceptual entropy, and whatever the first pass leaves unspent is
+    /// handed back to the channel that can still use it.
+    fn allocate_and_fit(&mut self, num_ch: usize) {
+        let total = self.payload_budget(num_ch);
+        let demand: Vec<f32> =
+            (0..num_ch).map(|c| self.channels[c].psycho.perceptual_entropy.max(1.0)).collect();
+        let sum: f32 = demand.iter().sum();
 
-        let mut bits = 0usize;
-        for b in 0..max_sfb {
+        let mut budgets: Vec<usize> =
+            demand.iter().map(|d| (total as f32 * d / sum) as usize).collect();
+        for c in 0..num_ch {
+            self.fit_channel(c, budgets[c]);
+        }
+
+        // One redistribution round: give the slack to the hungriest channel, which
+        // is the one whose noise floor the extra bits will lower the most.
+        for _ in 0..2 {
+            let used: usize = (0..num_ch).map(|c| self.channels[c].coded.bits).sum();
+            if used + total / 32 >= total {
+                break;
+            }
+            let Some(hungriest) = (0..num_ch)
+                .filter(|&c| self.channels[c].coded.bits >= budgets[c].saturating_sub(8))
+                .max_by(|&a, &b| demand[a].total_cmp(&demand[b]))
+            else {
+                break;
+            };
+            budgets[hungriest] += total - used;
+            self.fit_channel(hungriest, budgets[hungriest]);
+        }
+    }
+
+    /// Choose which bands of a stereo pair to code as mid and side.
+    ///
+    /// Where the two channels are similar, the side signal is small and costs far
+    /// fewer bits than a second full channel; where they are not, mid/side spreads
+    /// each channel's noise into the other and costs quality. The usual test
+    /// compares the energy the two representations would have to code, band by band,
+    /// and takes whichever is smaller.
+    fn decide_mid_side(&mut self) {
+        let bands = self.num_bands.min(self.max_sfb);
+        let (left, right) = self.channels.split_at_mut(1);
+        let left = &mut left[0];
+        let right = &mut right[0];
+
+        for b in 0..bands {
             let lo = self.sfb_offsets[b];
             let hi = self.sfb_offsets[b + 1];
-            quantize_band(&ch.spectrum[lo..hi], scalefactor, &mut ch.quant[lo..hi]);
-            let choice = choose_codebook(&ch.quant[lo..hi]);
-            ch.choices[b] = choice;
-            bits += choice.bits as usize;
+
+            let mut lr = 0.0f64;
+            let mut ms = 0.0f64;
+            for i in lo..hi {
+                let l = left.spectrum[i] as f64;
+                let r = right.spectrum[i] as f64;
+                lr += l * l + r * r;
+                let m = 0.5 * (l + r);
+                let s = 0.5 * (l - r);
+                ms += m * m + s * s;
+            }
+            // A tie goes to left/right, which never makes anything worse.
+            self.ms_mask[b] = ms < lr * 0.98;
         }
 
-        // Section data: one run-length record per codebook change.
-        let mut sections = 1usize;
-        for b in 1..max_sfb {
-            if ch.choices[b].codebook != ch.choices[b - 1].codebook {
-                sections += 1;
+        // The mask is transmitted per band, so a frame with no band worth switching
+        // saves the mask itself by declaring none.
+        self.ms_used = self.ms_mask[..bands].iter().any(|&v| v);
+        if !self.ms_used {
+            return;
+        }
+
+        for b in 0..bands {
+            if !self.ms_mask[b] {
+                continue;
+            }
+            for i in self.sfb_offsets[b]..self.sfb_offsets[b + 1] {
+                let l = left.spectrum[i];
+                let r = right.spectrum[i];
+                left.spectrum[i] = 0.5 * (l + r);
+                right.spectrum[i] = 0.5 * (l - r);
             }
         }
-        bits += sections * (4 + 5);
-        // Scalefactors: one Huffman-coded delta per coded band. All bands share one
-        // scalefactor here, so every delta is zero; use that codeword's real length
-        // rather than a guess, so the budget the rate loop enforces is exact.
-        let zero_delta_bits = crate::encoder::aac::huffman::scalefactor_codeword(0)
-            .map_or(2, |c| c.len as usize);
-        let coded = ch.choices[..max_sfb].iter().filter(|c| c.codebook != 0).count();
-        bits += coded * zero_delta_bits;
-        bits
+    }
+
+    /// Run the masking model for one channel.
+    fn analyse_channel(&mut self, c: usize) {
+        let offsets = &self.sfb_offsets[..=self.num_bands];
+        let ch = &mut self.channels[c];
+        ch.model.analyse(
+            &ch.spectrum,
+            offsets,
+            crate::types::WindowSequence::OnlyLongSequence,
+            &mut ch.psycho,
+        );
+    }
+
+    /// Quantize one channel to fit `budget` payload bits.
+    fn fit_channel(&mut self, c: usize, budget: usize) {
+        let offsets = &self.sfb_offsets[..=self.num_bands];
+        let ch = &mut self.channels[c];
+        let model = &ch.model;
+        let bits = self.rate.fit(
+            &ch.spectrum,
+            offsets,
+            &ch.psycho,
+            &|b| model.min_snr(b),
+            budget,
+            &mut ch.coded,
+        );
+
+        if std::env::var_os("AACENC_TRACE").is_some() {
+            let peak_q = ch.coded.quant.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+            let coded = ch.coded.choices.iter().filter(|c| c.codebook != 0).count();
+            eprintln!(
+                "enc frame {} ch {c} bits {bits}/{budget} pe {:.0} coded_bands {coded} peak_q {peak_q}",
+                self.frame_count + 1,
+                ch.psycho.perceptual_entropy
+            );
+        }
     }
 
     /// Serialize the frame.
@@ -288,7 +369,14 @@ impl Encoder {
                 w.write_u8(0, 4);
                 w.write_bit(true); // common_window
                 write_ics_info(w, self.max_sfb);
-                w.write_u8(0, 2); // ms_mask_present = 0
+                if self.ms_used {
+                    w.write_u8(1, 2); // ms_mask_present: per band
+                    for b in 0..self.max_sfb {
+                        w.write_bit(self.ms_mask[b]);
+                    }
+                } else {
+                    w.write_u8(0, 2); // ms_mask_present: none
+                }
                 write_channel_body(w, &self.channels[0], &self.sfb_offsets, self.max_sfb);
                 write_channel_body(w, &self.channels[1], &self.sfb_offsets, self.max_sfb);
 
@@ -338,42 +426,40 @@ fn write_ics_info(w: &mut BitWriter, max_sfb: usize) {
 }
 
 /// Write a whole `individual_channel_stream()` including its `ics_info`.
-fn write_channel(
-    w: &mut BitWriter,
-    ch: &ChannelState,
-    offsets: &[usize],
-    max_sfb: usize,
-) {
-    w.write_u8((ch.scalefactors[0] & 0xFF) as u8, 8); // global_gain
+fn write_channel(w: &mut BitWriter, ch: &ChannelState, offsets: &[usize], max_sfb: usize) {
+    w.write_u8(global_gain(ch, max_sfb), 8);
     write_ics_info(w, max_sfb);
     write_ics_payload(w, ch, offsets, max_sfb);
 }
 
 /// Write an `individual_channel_stream()` whose `ics_info` came from the element.
-fn write_channel_body(
-    w: &mut BitWriter,
-    ch: &ChannelState,
-    offsets: &[usize],
-    max_sfb: usize,
-) {
-    w.write_u8((ch.scalefactors[0] & 0xFF) as u8, 8); // global_gain
+fn write_channel_body(w: &mut BitWriter, ch: &ChannelState, offsets: &[usize], max_sfb: usize) {
+    w.write_u8(global_gain(ch, max_sfb), 8);
     write_ics_payload(w, ch, offsets, max_sfb);
 }
 
+/// The `global_gain` field, which the scalefactor deltas are counted from.
+///
+/// The decoder starts its running scalefactor at this value and adds the first
+/// coded band's delta to it like any other, so setting it to that band's
+/// scalefactor makes the first delta zero.
+fn global_gain(ch: &ChannelState, max_sfb: usize) -> u8 {
+    let first = ch.coded.first_coded.filter(|&b| b < max_sfb);
+    match first {
+        Some(b) => ch.coded.scalefactors[b].clamp(0, 255) as u8,
+        None => SF_OFFSET as u8,
+    }
+}
+
 /// Write section data, scalefactors, tool flags and spectral data.
-fn write_ics_payload(
-    w: &mut BitWriter,
-    ch: &ChannelState,
-    offsets: &[usize],
-    max_sfb: usize,
-) {
+fn write_ics_payload(w: &mut BitWriter, ch: &ChannelState, offsets: &[usize], max_sfb: usize) {
     // Section data: run-length runs of equal codebooks, with escape coding for
     // runs longer than the 5-bit length field can hold.
     let mut b = 0usize;
     while b < max_sfb {
-        let cb = ch.choices[b].codebook;
+        let cb = ch.coded.choices[b].codebook;
         let mut run = 1usize;
-        while b + run < max_sfb && ch.choices[b + run].codebook == cb {
+        while b + run < max_sfb && ch.coded.choices[b + run].codebook == cb {
             run += 1;
         }
         w.write_u8(cb, 4);
@@ -386,13 +472,20 @@ fn write_ics_payload(
         b += run;
     }
 
-    // Scalefactor data: the standard codes a DPCM delta for every band whose
-    // codebook is not ZERO, including the first. Every band here shares the global
-    // gain, so every delta is zero.
+    // Scalefactor data: a DPCM delta for every band whose codebook is not ZERO,
+    // the first one counted from `global_gain`.
+    let mut previous: Option<i32> = None;
     for b in 0..max_sfb {
-        if ch.choices[b].codebook != 0 {
-            write_scalefactor_delta(w, 0);
+        if ch.coded.choices[b].codebook == 0 {
+            continue;
         }
+        let sf = ch.coded.scalefactors[b];
+        let delta = match previous {
+            Some(p) => sf - p,
+            None => 0,
+        };
+        previous = Some(sf);
+        write_scalefactor_delta(w, delta);
     }
 
     w.write_bit(false); // pulse_data_present
@@ -400,13 +493,13 @@ fn write_ics_payload(
     w.write_bit(false); // gain_control_data_present
 
     for b in 0..max_sfb {
-        let cb = ch.choices[b].codebook;
+        let cb = ch.coded.choices[b].codebook;
         if cb == 0 {
             continue;
         }
         let lo = offsets[b];
         let hi = offsets[b + 1];
-        write_band(w, cb, &ch.quant[lo..hi]);
+        write_band(w, cb, &ch.coded.quant[lo..hi]);
     }
 }
 
