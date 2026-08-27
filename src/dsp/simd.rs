@@ -22,6 +22,16 @@
 //!
 //! The rest of the crate denies `unsafe_code`; this module is the single audited
 //! exception.
+//!
+//! # When these are worth their weight
+//!
+//! Built with `-C target-cpu=native`, as this repository's `.cargo/config.toml`
+//! does, LLVM already vectorizes the straight-line loops these kernels replace, and
+//! they measure the same. They earn their place in a build that does not name a CPU:
+//! a crate compiled for baseline `x86-64` gets only SSE2 from the autovectoriser,
+//! while the AVX/FMA kernels here are selected at run time on any machine that has
+//! them. The dispatch costs one predictable branch per call, over arrays of at least
+//! thirty-two elements.
 
 #![allow(unsafe_code)]
 
@@ -78,6 +88,76 @@ pub fn radix4_twiddled(
     #[allow(unreachable_code)]
     {
         let _ = (q0, q1, q2, q3, tw1, tw2, tw3);
+        false
+    }
+}
+
+/// Multiply two complex arrays element by element, into a third.
+///
+/// `out[i] = a[i] * b[i]`, or with `b[i]` conjugated first when `conjugate_b` is set.
+/// Returns `false` if no kernel applies, in which case the caller runs its scalar
+/// loop. This is the shape of both quadrature filterbank twiddles, which between
+/// them account for a quarter of the arithmetic in a band-replicated decode.
+#[inline]
+pub fn cmul(out: &mut [Complex32], a: &[Complex32], b: &[Complex32], conjugate_b: bool) -> bool {
+    let n = out.len();
+    if n < LANES_MIN || a.len() < n || b.len() < n {
+        return false;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is guaranteed on aarch64, and the lengths were checked above.
+        unsafe { neon::cmul_array(out, a, b, conjugate_b) };
+        return true;
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(target_arch = "aarch64")))]
+    {
+        if std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: the features were just detected and the lengths checked above.
+            unsafe { avx::cmul(out, a, b, conjugate_b) };
+            return true;
+        }
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let _ = (out, a, b, conjugate_b);
+        false
+    }
+}
+
+/// Scale a real array by a second and accumulate into a third.
+///
+/// `acc[i] += a[i] * b[i]`. Returns `false` if no kernel applies. This is the
+/// windowing step of both filterbanks.
+#[inline]
+pub fn mul_add(acc: &mut [f32], a: &[f32], b: &[f32]) -> bool {
+    let n = acc.len();
+    if n < LANES_MIN || a.len() < n || b.len() < n {
+        return false;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is guaranteed on aarch64, and the lengths were checked above.
+        unsafe { neon::mul_add(acc, a, b) };
+        return true;
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(target_arch = "aarch64")))]
+    {
+        if std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: the features were just detected and the lengths checked above.
+            unsafe { avx::mul_add(acc, a, b) };
+            return true;
+        }
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let _ = (acc, a, b);
         false
     }
 }
@@ -202,6 +282,60 @@ mod neon {
             q3[i] = Complex32::new(t1.re - t3.im, t1.im + t3.re);
         }
     }
+
+    /// Element-wise complex multiply over a whole array.
+    ///
+    /// # Safety
+    /// `a` and `b` must each be at least `out.len()` long.
+    #[inline]
+    pub unsafe fn cmul_array(
+        out: &mut [Complex32],
+        a: &[Complex32],
+        b: &[Complex32],
+        conjugate_b: bool,
+    ) {
+        let n = out.len();
+        let vectored = n - n % super::LANES;
+        // SAFETY: every access below stays inside the checked lengths.
+        unsafe {
+            for i in (0..vectored).step_by(super::LANES) {
+                let (ar, ai) = load4(a.as_ptr().add(i));
+                let (br, mut bi) = load4(b.as_ptr().add(i));
+                if conjugate_b {
+                    bi = vnegq_f32(bi);
+                }
+                let (re, im) = cmul(ar, ai, br, bi);
+                store4(out.as_mut_ptr().add(i), re, im);
+            }
+        }
+        for i in vectored..n {
+            let (x, y) = (a[i], b[i]);
+            let yi = if conjugate_b { -y.im } else { y.im };
+            out[i] = Complex32::new(x.re * y.re - x.im * yi, x.re * yi + x.im * y.re);
+        }
+    }
+
+    /// Multiply and accumulate over a whole array.
+    ///
+    /// # Safety
+    /// `a` and `b` must each be at least `acc.len()` long.
+    #[inline]
+    pub unsafe fn mul_add(acc: &mut [f32], a: &[f32], b: &[f32]) {
+        let n = acc.len();
+        let vectored = n - n % super::LANES;
+        // SAFETY: every access below stays inside the checked lengths.
+        unsafe {
+            for i in (0..vectored).step_by(super::LANES) {
+                let va = vld1q_f32(a.as_ptr().add(i));
+                let vb = vld1q_f32(b.as_ptr().add(i));
+                let vc = vld1q_f32(acc.as_ptr().add(i));
+                vst1q_f32(acc.as_mut_ptr().add(i), vfmaq_f32(vc, va, vb));
+            }
+        }
+        for i in vectored..n {
+            acc[i] += a[i] * b[i];
+        }
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", not(target_arch = "aarch64")))]
@@ -310,6 +444,56 @@ mod avx {
             q3[i] = Complex32::new(t1.re - t3.im, t1.im + t3.re);
         }
     }
+
+    /// Element-wise complex multiply over a whole array.
+    ///
+    /// # Safety
+    /// AVX and FMA must be available and `a`, `b` must each be at least `out.len()`
+    /// long.
+    #[target_feature(enable = "avx,fma")]
+    pub unsafe fn cmul(
+        out: &mut [Complex32],
+        a: &[Complex32],
+        b: &[Complex32],
+        conjugate_b: bool,
+    ) {
+        // SAFETY: every access below stays inside the checked lengths, and the
+        // caller guaranteed the features this function is compiled for.
+        unsafe {
+            let n = out.len();
+            let sign = if conjugate_b { -1.0f32 } else { 1.0f32 };
+            for i in 0..n {
+                let x = *a.get_unchecked(i);
+                let y = *b.get_unchecked(i);
+                let yi = y.im * sign;
+                *out.get_unchecked_mut(i) =
+                    Complex32::new(x.re * y.re - x.im * yi, x.re * yi + x.im * y.re);
+            }
+        }
+    }
+
+    /// Multiply and accumulate over a whole array.
+    ///
+    /// # Safety
+    /// AVX and FMA must be available and `a`, `b` must each be at least `acc.len()`
+    /// long.
+    #[target_feature(enable = "avx,fma")]
+    pub unsafe fn mul_add(acc: &mut [f32], a: &[f32], b: &[f32]) {
+        // SAFETY: the loop stays inside the checked lengths.
+        unsafe {
+            let n = acc.len();
+            let vectored = n - n % 8;
+            for i in (0..vectored).step_by(8) {
+                let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                let vc = _mm256_loadu_ps(acc.as_ptr().add(i));
+                _mm256_storeu_ps(acc.as_mut_ptr().add(i), _mm256_fmadd_ps(va, vb, vc));
+            }
+            for i in vectored..n {
+                *acc.get_unchecked_mut(i) += a.get_unchecked(i) * b.get_unchecked(i);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -394,5 +578,67 @@ mod tests {
         let mut d = sample(8, 4);
         let t = sample(16, 5);
         assert!(!radix4_twiddled(&mut a, &mut b, &mut c, &mut d, &t, &t, &t));
+    }
+
+    /// The complex-multiply kernel must agree with the scalar definition, in both
+    /// the plain and the conjugated form.
+    #[test]
+    fn cmul_matches_the_scalar_form() {
+        for n in [4usize, 8, 17, 32, 64, 128] {
+            let a: Vec<Complex32> =
+                (0..n).map(|i| Complex32::new(0.3 * i as f32 - 1.0, 0.7 - 0.05 * i as f32)).collect();
+            let b: Vec<Complex32> =
+                (0..n).map(|i| Complex32::new(0.11 * i as f32, 1.3 - 0.02 * i as f32)).collect();
+
+            for conjugate in [false, true] {
+                let mut got = vec![Complex32::default(); n];
+                if !cmul(&mut got, &a, &b, conjugate) {
+                    continue;
+                }
+                for i in 0..n {
+                    let bi = if conjugate { -b[i].im } else { b[i].im };
+                    let want = Complex32::new(
+                        a[i].re * b[i].re - a[i].im * bi,
+                        a[i].re * bi + a[i].im * b[i].re,
+                    );
+                    assert!(
+                        (want.re - got[i].re).abs() < 1e-4 && (want.im - got[i].im).abs() < 1e-4,
+                        "n {n} conj {conjugate} index {i}: want {want:?}, got {:?}",
+                        got[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The multiply-accumulate kernel must agree with the scalar loop, including on
+    /// lengths that are not a whole number of vectors.
+    #[test]
+    fn mul_add_matches_the_scalar_form() {
+        for n in [4usize, 5, 13, 32, 64, 320] {
+            let a: Vec<f32> = (0..n).map(|i| 0.25 * i as f32 - 3.0).collect();
+            let b: Vec<f32> = (0..n).map(|i| 1.5 - 0.03 * i as f32).collect();
+            let mut got = vec![0.5f32; n];
+            let mut want = got.clone();
+            for i in 0..n {
+                want[i] += a[i] * b[i];
+            }
+            if !mul_add(&mut got, &a, &b) {
+                continue;
+            }
+            for i in 0..n {
+                assert!((want[i] - got[i]).abs() < 1e-4, "n {n} index {i}: {} vs {}", want[i], got[i]);
+            }
+        }
+    }
+
+    /// A slice too short to vectorize must be declined rather than mishandled.
+    #[test]
+    fn short_slices_fall_back() {
+        let a = [1.0f32, 2.0];
+        let b = [3.0f32, 4.0];
+        let mut acc = [0.0f32, 0.0];
+        assert!(!mul_add(&mut acc, &a, &b));
+        assert_eq!(acc, [0.0, 0.0]);
     }
 }

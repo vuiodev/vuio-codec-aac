@@ -67,6 +67,12 @@ struct ChannelState {
     model: PsychoacousticModel,
     /// Noise shaping applied to this frame, if any.
     tns: Option<TnsFilter>,
+    /// Scalefactor estimation and the search that fits the budget.
+    ///
+    /// One per channel rather than one per encoder: it carries the threshold scale
+    /// the channel settled on last frame, and holding it here is also what lets the
+    /// channels be quantized in parallel.
+    rate: RateLoop,
 }
 
 impl ChannelState {
@@ -85,6 +91,7 @@ impl ChannelState {
             coded: Quantization::new(n, bands),
             model: PsychoacousticModel::new(sample_rate_hz, bitrate_per_channel, offsets, false),
             tns: None,
+            rate: RateLoop::new(n),
         }
     }
 }
@@ -106,8 +113,6 @@ pub struct Encoder {
     frame_count: u64,
     mdct_scratch: Vec<Complex32>,
     writer: BitWriter,
-    /// Scalefactor estimation and the bisection that fits the budget.
-    rate: RateLoop,
     /// Bands coded mid/side, when the frame is a stereo pair.
     ms_mask: Vec<bool>,
     /// Whether any band of the current frame is coded mid/side.
@@ -158,7 +163,6 @@ impl Encoder {
             frame_count: 0,
             mdct_scratch: vec![Complex32::default(); scratch_len],
             writer: BitWriter::with_capacity(4096),
-            rate: RateLoop::new(n),
             ms_mask: vec![false; num_bands],
             ms_used: false,
         })
@@ -259,9 +263,7 @@ impl Encoder {
 
         let mut budgets: Vec<usize> =
             demand.iter().map(|d| (total as f32 * d / sum) as usize).collect();
-        for c in 0..num_ch {
-            self.fit_channel(c, budgets[c]);
-        }
+        self.fit_all(&budgets);
 
         // One redistribution round: give the slack to the hungriest channel, which
         // is the one whose noise floor the extra bits will lower the most.
@@ -347,29 +349,32 @@ impl Encoder {
     /// Quantize one channel to fit `budget` payload bits.
     fn fit_channel(&mut self, c: usize, budget: usize) {
         let offsets = &self.sfb_offsets[..=self.num_bands];
-        let ch = &mut self.channels[c];
-        let model = &ch.model;
-        let bits = self.rate.fit(
-            &ch.spectrum,
-            offsets,
-            &ch.psycho,
-            &|b| model.min_snr(b),
-            budget,
-            &mut ch.coded,
-        );
+        let frame = self.frame_count;
+        fit_one(&mut self.channels[c], offsets, budget, c, frame);
+    }
 
-        if std::env::var_os("AACENC_TRACE").is_some() {
-            let peak_q = ch.coded.quant.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
-            let coded = ch.coded.choices.iter().filter(|c| c.codebook != 0).count();
-            let tns = match &ch.tns {
-                Some(f) => format!("order {} gain {:.2}", f.spec.order, f.gain),
-                None => "off".to_string(),
-            };
-            eprintln!(
-                "enc frame {} ch {c} bits {bits}/{budget} pe {:.0} coded_bands {coded} peak_q {peak_q} tns {tns}",
-                self.frame_count + 1,
-                ch.psycho.perceptual_entropy
-            );
+
+    /// Quantize every channel to its share of the budget.
+    ///
+    /// The channels share nothing at this point — each has its own spectrum, model
+    /// and rate loop — so on a multi-channel frame they run in parallel.
+    fn fit_all(&mut self, budgets: &[usize]) {
+        let offsets = &self.sfb_offsets[..=self.num_bands];
+        let frame = self.frame_count;
+
+        #[cfg(feature = "rayon")]
+        if self.channels.len() > 2 {
+            use rayon::prelude::*;
+            self.channels
+                .par_iter_mut()
+                .zip(budgets.par_iter())
+                .enumerate()
+                .for_each(|(c, (ch, &budget))| fit_one(ch, offsets, budget, c, frame));
+            return;
+        }
+
+        for (c, (ch, &budget)) in self.channels.iter_mut().zip(budgets.iter()).enumerate() {
+            fit_one(ch, offsets, budget, c, frame);
         }
     }
 
@@ -435,6 +440,29 @@ impl Encoder {
         frame.extend_from_slice(&payload);
         self.frame_count += 1;
         Ok(frame)
+    }
+}
+
+/// Run one channel's rate loop.
+///
+/// Free rather than a method so that a parallel run borrows one channel at a time
+/// instead of the whole encoder.
+fn fit_one(ch: &mut ChannelState, offsets: &[usize], budget: usize, index: usize, frame: u64) {
+    let ChannelState { spectrum, psycho, coded, model, rate, tns, .. } = ch;
+    let bits = rate.fit(spectrum, offsets, psycho, &|b| model.min_snr(b), budget, coded);
+
+    if std::env::var_os("AACENC_TRACE").is_some() {
+        let peak_q = coded.quant.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+        let bands = coded.choices.iter().filter(|c| c.codebook != 0).count();
+        let shaping = match tns {
+            Some(f) => format!("order {} gain {:.2}", f.spec.order, f.gain),
+            None => "off".to_string(),
+        };
+        eprintln!(
+            "enc frame {} ch {index} bits {bits}/{budget} pe {:.0} coded_bands {bands} peak_q {peak_q} tns {shaping}",
+            frame + 1,
+            psycho.perceptual_entropy
+        );
     }
 }
 

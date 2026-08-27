@@ -62,6 +62,11 @@ pub struct Quantization {
     pub bits: usize,
     /// First band that carries data, if any.
     pub first_coded: Option<usize>,
+    /// Threshold scale, in dB, the last frame settled on.
+    ///
+    /// Successive frames of the same programme need almost the same one, so it
+    /// brackets the search and saves most of its iterations.
+    scale_db: f32,
 }
 
 impl Quantization {
@@ -73,9 +78,17 @@ impl Quantization {
             quant: vec![0; lines],
             bits: 0,
             first_coded: None,
+            scale_db: 0.0,
         }
     }
 }
+
+/// Magnitudes the inverse power law is tabulated for.
+///
+/// The quantizer's inverse is a cube root, far too slow to call once per coefficient
+/// in a loop that quantizes the frame a dozen times over. Almost every magnitude is
+/// small, so a table covers the common case and the tail falls back on `powf`.
+const POW43_TABLE: usize = 1024;
 
 /// Turns thresholds into scalefactors, and scalefactors into a frame that fits.
 #[derive(Debug, Clone)]
@@ -84,13 +97,21 @@ pub struct RateLoop {
     thresholds: [f32; MAX_BANDS],
     /// Scratch for the refinement's trial quantization.
     trial: Vec<i32>,
+    /// `q^(4/3)` for `q` below [`POW43_TABLE`].
+    pow43: Box<[f32; POW43_TABLE]>,
 }
 
 impl RateLoop {
     /// Build a rate loop for frames of `lines` coefficients.
     pub fn new(lines: usize) -> Self {
-        Self { thresholds: [0.0; MAX_BANDS], trial: vec![0; lines] }
+        let mut pow43 = Box::new([0.0f32; POW43_TABLE]);
+        for (q, slot) in pow43.iter_mut().enumerate() {
+            *slot = (q as f32).powf(4.0 / 3.0);
+        }
+        Self { thresholds: [0.0; MAX_BANDS], trial: vec![0; lines], pow43 }
     }
+
+
 
     /// Quantize one channel to fit `budget` payload bits.
     ///
@@ -106,20 +127,59 @@ impl RateLoop {
         budget: usize,
         out: &mut Quantization,
     ) -> usize {
-        // The threshold scale is searched in dB, where cost is close to linear in
-        // it, so a fixed number of bisection steps lands within a fraction of a dB.
-        // The range has to reach far enough below zero that a generous bitrate can
-        // still buy a finer noise floor than the model asked for.
-        let mut low = -80.0f32;
-        let mut high = 120.0f32;
-        let mut best_scale = high;
+        // Cost falls monotonically as the thresholds rise, so the search is a
+        // bracket followed by bisection. The bracket starts at what the previous
+        // frame settled on and widens geometrically, which on real material lands
+        // in one or two probes instead of the eight a blind range would take.
+        const FLOOR: f32 = -80.0;
+        const CEILING: f32 = 120.0;
+        const TOLERANCE: f32 = 0.35;
+
+        let hint = out.scale_db.clamp(FLOOR, CEILING);
+        let mut low = FLOOR;
+        let mut high = CEILING;
+        let mut best = CEILING;
         let mut fits = false;
 
-        for _ in 0..16 {
+        if self.attempt(spectrum, offsets, psycho, min_snr, hint, out) <= budget {
+            best = hint;
+            fits = true;
+            high = hint;
+            let mut step = 2.0f32;
+            while high - step > FLOOR {
+                let probe = high - step;
+                if self.attempt(spectrum, offsets, psycho, min_snr, probe, out) <= budget {
+                    best = probe;
+                    high = probe;
+                    step *= 2.0;
+                } else {
+                    low = probe;
+                    break;
+                }
+            }
+        } else {
+            low = hint;
+            let mut step = 2.0f32;
+            loop {
+                let probe = (low + step).min(CEILING);
+                if self.attempt(spectrum, offsets, psycho, min_snr, probe, out) <= budget {
+                    best = probe;
+                    fits = true;
+                    high = probe;
+                    break;
+                }
+                low = probe;
+                if probe >= CEILING {
+                    break;
+                }
+                step *= 2.0;
+            }
+        }
+
+        while high - low > TOLERANCE {
             let mid = 0.5 * (low + high);
-            let bits = self.attempt(spectrum, offsets, psycho, min_snr, mid, out);
-            if bits <= budget {
-                best_scale = mid;
+            if self.attempt(spectrum, offsets, psycho, min_snr, mid, out) <= budget {
+                best = mid;
                 fits = true;
                 high = mid;
             } else {
@@ -128,9 +188,10 @@ impl RateLoop {
         }
 
         if !fits {
-            best_scale = high;
+            best = CEILING;
         }
-        self.attempt(spectrum, offsets, psycho, min_snr, best_scale, out)
+        out.scale_db = best;
+        self.attempt(spectrum, offsets, psycho, min_snr, best, out)
     }
 
     /// Quantize at one threshold scale and report the cost.
@@ -231,14 +292,15 @@ impl RateLoop {
     ) -> i32 {
         quantize_band(band, start, quant);
         let mut best = start;
-        let best_error = distortion(band, quant, start);
+        let best_error = distortion(&self.pow43, band, quant, start);
 
         if best_error > DISTORTION_SLACK * threshold {
             // Already too coarse: the only way out is a finer step, if there is one.
             if start > floor && start > MIN_SCALEFACTOR {
-                let trial = &mut self.trial[..band.len()];
+                let Self { trial, pow43, .. } = self;
+                let trial = &mut trial[..band.len()];
                 quantize_band(band, start - 1, trial);
-                let error = distortion(band, trial, start - 1);
+                let error = distortion(pow43, band, trial, start - 1);
                 if error < best_error {
                     best = start - 1;
                     quant.copy_from_slice(trial);
@@ -255,9 +317,10 @@ impl RateLoop {
             if candidate > MAX_SCALEFACTOR {
                 break;
             }
-            let trial = &mut self.trial[..band.len()];
+            let Self { trial, pow43, .. } = self;
+            let trial = &mut trial[..band.len()];
             quantize_band(band, candidate, trial);
-            if distortion(band, trial, candidate) < allowed {
+            if distortion(pow43, band, trial, candidate) < allowed {
                 best = candidate;
                 quant.copy_from_slice(trial);
             }
@@ -288,6 +351,26 @@ fn initial_scalefactor(band: &[f32], threshold: f32, peak: f32) -> Option<i32> {
     Some(SF_OFFSET + ((8.0 / 3.0) * ratio.log2()).floor() as i32)
 }
 
+/// Squared error a band's quantization leaves behind.
+///
+/// Measured the way the decoder will hear it: each magnitude is put back through the
+/// inverse power law and the scalefactor's gain, and compared with what went in.
+#[inline]
+fn distortion(pow43: &[f32; POW43_TABLE], band: &[f32], quant: &[i32], scalefactor: i32) -> f32 {
+    let gain = (0.25 * (scalefactor - SF_OFFSET) as f32).exp2();
+    let mut sum = 0.0f32;
+    for (&x, &q) in band.iter().zip(quant.iter()) {
+        let magnitude = q.unsigned_abs() as usize;
+        let inverse = match pow43.get(magnitude) {
+            Some(&v) => v,
+            None => (magnitude as f32).powf(4.0 / 3.0),
+        };
+        let error = x.abs() - inverse * gain;
+        sum += error * error;
+    }
+    sum
+}
+
 /// Smallest scalefactor that keeps every coefficient inside the coded range.
 fn smallest_representable(peak: f32) -> i32 {
     if peak <= 0.0 {
@@ -297,22 +380,6 @@ fn smallest_representable(peak: f32) -> i32 {
     let headroom = (MAX_QUANT_MAGNITUDE as f32) - 0.5;
     let sf = (16.0 / 3.0) * (0.75 * peak.log2() - headroom.log2());
     SF_OFFSET + sf.ceil() as i32
-}
-
-/// Squared error a band's quantization leaves behind.
-///
-/// Measured the way the decoder will hear it: each magnitude is put back through
-/// the inverse power law and the scalefactor's gain, and compared with what went in.
-fn distortion(band: &[f32], quant: &[i32], scalefactor: i32) -> f32 {
-    let gain = (0.25 * (scalefactor - SF_OFFSET) as f32).exp2();
-    let mut sum = 0.0f32;
-    for (&x, &q) in band.iter().zip(quant.iter()) {
-        let magnitude = q.unsigned_abs() as f32;
-        let reconstructed = magnitude * magnitude.cbrt() * gain;
-        let error = x.abs() - reconstructed;
-        sum += error * error;
-    }
-    sum
 }
 
 /// Payload bits one channel's quantization costs.

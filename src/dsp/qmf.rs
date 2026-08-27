@@ -32,6 +32,7 @@
 //! history. The windowing pass then always reads one contiguous run.
 
 use crate::dsp::fft::{Complex32, FftContext};
+use crate::dsp::simd;
 use crate::tables::qmf::{QMF_ANALYSIS_WINDOW, QMF_SYNTHESIS_WINDOW};
 
 /// Subbands the analysis bank produces per time slot.
@@ -132,8 +133,10 @@ impl QmfAnalysis {
         for j in 0..5 {
             let w = &window[j * 64..j * 64 + 64];
             let c = &QMF_ANALYSIS_WINDOW[j * 64..j * 64 + 64];
-            for n in 0..64 {
-                u[n] += w[n] * c[n];
+            if !simd::mul_add(&mut u, w, c) {
+                for n in 0..64 {
+                    u[n] += w[n] * c[n];
+                }
             }
         }
 
@@ -145,11 +148,13 @@ impl QmfAnalysis {
         }
         self.fft.forward_into(&self.scratch_in[..], &mut self.scratch_out[..]);
 
-        for (k, out) in output.iter_mut().enumerate() {
-            let s = self.scratch_out[k];
-            let t = self.post[k];
-            // conj(s) * t
-            *out = Complex32::new(s.re * t.re + s.im * t.im, s.re * t.im - s.im * t.re);
+        // conj(s) * t, over the subbands the bank produces.
+        if !simd::cmul(output, &self.post[..], &self.scratch_out[..QMF_ANALYSIS_BANDS], true) {
+            for (k, out) in output.iter_mut().enumerate() {
+                let s = self.scratch_out[k];
+                let t = self.post[k];
+                *out = Complex32::new(s.re * t.re + s.im * t.im, s.re * t.im - s.im * t.re);
+            }
         }
     }
 
@@ -272,8 +277,12 @@ impl QmfSynthesis {
         debug_assert_eq!(input.len(), bands);
         debug_assert_eq!(output.len(), bands);
 
-        for (dst, (&x, &p)) in self.scratch_in.iter_mut().zip(input.iter().zip(self.pre.iter())) {
-            *dst = Complex32::new(x.re * p.re - x.im * p.im, x.re * p.im + x.im * p.re);
+        if !simd::cmul(&mut self.scratch_in[..bands], input, &self.pre, false) {
+            for (dst, (&x, &p)) in
+                self.scratch_in[..bands].iter_mut().zip(input.iter().zip(self.pre.iter()))
+            {
+                *dst = Complex32::new(x.re * p.re - x.im * p.im, x.re * p.im + x.im * p.re);
+            }
         }
         // Only the lower half carries subbands; the transform is over 2 * bands.
         self.scratch_in[bands..].fill(Complex32::default());
@@ -307,8 +316,10 @@ impl QmfSynthesis {
             let block = &v[e * two_bands..(e + 1) * two_bands];
             let half = if e.is_multiple_of(2) { &block[bands..] } else { &block[..bands] };
             let c = &proto[(9 - e) * bands..(9 - e) * bands + bands];
-            for i in 0..bands {
-                acc[i] += half[i] * c[i];
+            if !simd::mul_add(acc, half, c) {
+                for i in 0..bands {
+                    acc[i] += half[i] * c[i];
+                }
             }
         }
         let scale = 1.0 / QMF_ROUND_TRIP_GAIN;
