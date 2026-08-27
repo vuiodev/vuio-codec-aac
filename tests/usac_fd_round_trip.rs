@@ -9,8 +9,8 @@
 //! overlap-add filterbank the AAC-LC decoder uses.
 
 use vuiocodecaac::bitstream::BitReader;
-use vuiocodecaac::decoder::usac::fd::UsacFdDecoder;
-use vuiocodecaac::encoder::usac::fd::{FRAME_LEN, UsacFdEncoder};
+use vuiocodecaac::decoder::usac::fd::{UsacFdDecoder, UsacFdStereoDecoder};
+use vuiocodecaac::encoder::usac::fd::{FRAME_LEN, UsacFdEncoder, UsacFdStereoEncoder};
 
 /// A real, non-degenerate test signal: two tones plus enough high-frequency
 /// content that quantization spans a wide range of magnitudes, including
@@ -85,6 +85,96 @@ fn tonal_signal_round_trips_with_low_error() {
     let snr_db = 10.0 * (signal_energy / error_energy.max(1e-9)).log10();
     assert!(peak > 1000.0, "test signal must have real amplitude, got peak {peak}");
     assert!(snr_db > 20.0, "reconstruction SNR too low: {snr_db:.1} dB");
+}
+
+/// A smaller configured bit budget must produce a smaller encoded frame on
+/// the same audio, the observable proof that `set_budget_bits` actually
+/// drives a real rate-distortion tradeoff rather than being ignored.
+#[test]
+fn tighter_budget_produces_smaller_frames() {
+    let pcm = signal(FRAME_LEN);
+
+    let mut generous = UsacFdEncoder::new();
+    generous.set_budget_bits(20_000);
+    let big_block = generous.encode_frame(&pcm);
+
+    let mut tight = UsacFdEncoder::new();
+    tight.set_budget_bits(400);
+    let small_block = tight.encode_frame(&pcm);
+
+    assert!(
+        small_block.len() < big_block.len(),
+        "tight budget produced {} bytes, generous produced {} bytes",
+        small_block.len(),
+        big_block.len()
+    );
+
+    // The tight budget must still decode to something, even if coarse.
+    let mut decoder = UsacFdDecoder::new();
+    let mut reader = BitReader::new(&small_block);
+    let out = decoder.decode_frame(&mut reader).expect("even a coarse frame must decode");
+    assert_eq!(out.len(), FRAME_LEN);
+}
+
+/// Two tones panned hard left and hard right: mid/side should win on most
+/// bands (both channels share most of their energy), and the reconstruction
+/// of both channels must stay close to the original.
+#[test]
+fn stereo_signal_round_trips_with_low_error() {
+    let frames = 10;
+    let total = frames * FRAME_LEN;
+
+    let left: Vec<f32> = (0..total)
+        .map(|i| {
+            let t = i as f32;
+            (t * 0.041).sin() * 11000.0 + (t * 0.83).sin() * 2000.0
+        })
+        .collect();
+    let right: Vec<f32> = (0..total)
+        .map(|i| {
+            let t = i as f32;
+            (t * 0.041).sin() * 9000.0 + (t * 0.0037).cos() * 6000.0
+        })
+        .collect();
+
+    let mut encoder = UsacFdStereoEncoder::new();
+    let mut decoder = UsacFdStereoDecoder::new();
+
+    let mut decoded_left = vec![0.0f32; total];
+    let mut decoded_right = vec![0.0f32; total];
+
+    for f in 0..frames {
+        let l = &left[f * FRAME_LEN..(f + 1) * FRAME_LEN];
+        let r = &right[f * FRAME_LEN..(f + 1) * FRAME_LEN];
+        let block = encoder.encode_frame(l, r);
+        assert!(!block.is_empty(), "an encoded stereo frame must carry real payload");
+
+        let mut reader = BitReader::new(&block);
+        let (out_l, out_r) = decoder.decode_frame(&mut reader).expect("stereo frame must decode");
+        assert_eq!(out_l.len(), FRAME_LEN);
+        assert_eq!(out_r.len(), FRAME_LEN);
+
+        if f > 0 {
+            decoded_left[(f - 1) * FRAME_LEN..f * FRAME_LEN].copy_from_slice(&out_l);
+            decoded_right[(f - 1) * FRAME_LEN..f * FRAME_LEN].copy_from_slice(&out_r);
+        }
+    }
+
+    let snr = |decoded: &[f32], original: &[f32]| -> f64 {
+        let mut signal_energy = 0.0f64;
+        let mut error_energy = 0.0f64;
+        for i in 0..(frames - 1) * FRAME_LEN {
+            let e = (decoded[i] - original[i]) as f64;
+            error_energy += e * e;
+            signal_energy += (original[i] as f64).powi(2);
+        }
+        10.0 * (signal_energy / error_energy.max(1e-9)).log10()
+    };
+
+    let snr_l = snr(&decoded_left, &left);
+    let snr_r = snr(&decoded_right, &right);
+    assert!(snr_l > 20.0, "left channel reconstruction SNR too low: {snr_l:.1} dB");
+    assert!(snr_r > 20.0, "right channel reconstruction SNR too low: {snr_r:.1} dB");
 }
 
 #[test]

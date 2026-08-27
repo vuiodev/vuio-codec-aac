@@ -1,4 +1,4 @@
-//! Minimal USAC frequency-domain (FD) single-channel-element decoder.
+//! Minimal USAC frequency-domain (FD) decoder: single-channel and stereo.
 //!
 //! The counterpart to [`crate::encoder::usac::fd`]: reads one frame's
 //! `global_gain`, `scale_factor_data()` and arithmetic-coded spectral data,
@@ -8,6 +8,19 @@
 //! it `OnlyLongSequence`/`Sine` here is exact, not a reused approximation —
 //! this path never has anything else to feed it). See that module's docs
 //! for what is and is not covered by this minimal shape.
+//!
+//! # A decode-side bug the per-band rate loop surfaced
+//!
+//! The single-scalefactor-per-frame version of this decoder accumulated
+//! every `scale_factor_data()` delta into one final running scalar and
+//! dequantized the *whole* spectrum with it in one call — which happened to
+//! be harmless when the encoder only ever transmitted zero deltas after the
+//! first, but is wrong the moment scalefactors genuinely vary per band: the
+//! final accumulated value has nothing to do with any individual band's
+//! actual scalefactor. [`UsacFdDecoder::decode_frame`] now keeps the whole
+//! per-band array from [`read_scale_factor_data`] and dequantizes each
+//! band's coefficient range with its own value, matching what
+//! [`crate::encoder::usac::fd`]'s real per-band rate loop now transmits.
 
 use crate::bitstream::BitReader;
 use crate::decoder::aac::huffman::decode_scalefactor_delta;
@@ -35,61 +48,114 @@ pub const FRAME_LEN: usize = 1024;
 /// inside the reference decoder's own downstream stages.
 const ARITH_FIXED_POINT_SHIFT: f32 = 64.0;
 
-/// One FD single-channel element's worth of decoder state.
-pub struct UsacFdDecoder {
+/// Bands [`SFB_48_1024`] resolves to; shared setup both the mono and stereo
+/// decoders need.
+struct Layout {
+    sfb_offsets: [usize; MAX_SFB_LONG + 1],
+    num_sfb: usize,
+}
+
+impl Layout {
+    fn new() -> Self {
+        let mut sfb_offsets = [0usize; MAX_SFB_LONG + 1];
+        let count = compute_sfb_offsets(SFB_48_1024, &mut sfb_offsets);
+        Self { sfb_offsets, num_sfb: count - 1 }
+    }
+}
+
+/// One channel's arithmetic-coder context history and noise-fill seed.
+struct ChannelState {
     filterbank: Filterbank,
     overlap: Vec<f32>,
-    /// Bands `scale_factor_data()` carries; see the encoder's field of the
-    /// same name.
-    num_sfb: usize,
-    /// Arithmetic-coder context history, carried across frames.
     contexts: Contexts,
-    /// Threaded through to [`dequantize`] even though this path never sets
-    /// `with_noise` (noise filling is separate, larger work), since the seed
-    /// still has to live somewhere for when it does.
     noise_seed: u32,
 }
 
-impl UsacFdDecoder {
-    pub fn new() -> Self {
-        let mut offsets = [0usize; MAX_SFB_LONG + 1];
-        let count = compute_sfb_offsets(SFB_48_1024, &mut offsets);
+impl ChannelState {
+    fn new() -> Self {
         Self {
             filterbank: Filterbank::new(FRAME_LEN),
             overlap: vec![0.0; FRAME_LEN],
-            num_sfb: count - 1,
             contexts: Contexts::new(),
             noise_seed: 0,
         }
     }
+}
+
+/// Read `global_gain` followed by one Huffman-coded delta per remaining
+/// band into a full per-band scalefactor array, the shape
+/// [`crate::encoder::usac::fd::write_scale_factor_data`] writes.
+fn read_scale_factor_data(reader: &mut BitReader, num_sfb: usize) -> Result<Vec<i32>> {
+    let mut scalefactors = vec![0i32; num_sfb];
+    scalefactors[0] = reader.read_u8(8)? as i32;
+    for b in 1..num_sfb {
+        scalefactors[b] = scalefactors[b - 1] + decode_scalefactor_delta(reader)?;
+    }
+    Ok(scalefactors)
+}
+
+/// Dequantize one channel's coded magnitudes band by band, each with its
+/// own scalefactor, and scale the arithmetic coder's fixed-point output
+/// down into the same linear units the encoder quantized in.
+fn dequantize_channel(
+    quant: &[i32],
+    sfb_offsets: &[usize],
+    num_sfb: usize,
+    scalefactors: &[i32],
+    noise_seed: &mut u32,
+    spectral: &mut [f32],
+) {
+    let mut coef = vec![0i32; quant.len()];
+    for b in 0..num_sfb {
+        let lo = sfb_offsets[b];
+        let hi = sfb_offsets[b + 1].min(quant.len());
+        if lo >= hi {
+            continue;
+        }
+        dequantize(&quant[lo..hi], &mut coef[lo..hi], 0, false, noise_seed, fac_fix(scalefactors[b]));
+    }
+    for (s, &c) in spectral.iter_mut().zip(coef.iter()) {
+        *s = c as f32 / ARITH_FIXED_POINT_SHIFT;
+    }
+}
+
+/// One FD single-channel element's worth of decoder state.
+pub struct UsacFdDecoder {
+    layout: Layout,
+    channel: ChannelState,
+}
+
+impl UsacFdDecoder {
+    pub fn new() -> Self {
+        Self { layout: Layout::new(), channel: ChannelState::new() }
+    }
 
     /// Decode one frame's raw block into `FRAME_LEN` PCM samples.
     pub fn decode_frame(&mut self, reader: &mut BitReader) -> Result<Vec<f32>> {
-        let global_gain = reader.read_u8(8)? as i32;
-        let mut scalefactor = global_gain;
-        for _ in 1..self.num_sfb {
-            scalefactor += decode_scalefactor_delta(reader)?;
-        }
+        let num_sfb = self.layout.num_sfb;
+        let scalefactors = read_scale_factor_data(reader, num_sfb)?;
 
         let pairs = FRAME_LEN / 2;
         let mut quant = vec![0i32; FRAME_LEN];
-        decode_pairs(reader, &mut self.contexts, pairs, pairs, &mut quant);
-
-        let mut coef = vec![0i32; FRAME_LEN];
-        dequantize(&quant, &mut coef, 0, false, &mut self.noise_seed, fac_fix(scalefactor));
+        decode_pairs(reader, &mut self.channel.contexts, pairs, pairs, &mut quant);
 
         let mut spectral = vec![0.0f32; FRAME_LEN];
-        for (s, &c) in spectral.iter_mut().zip(coef.iter()) {
-            *s = c as f32 / ARITH_FIXED_POINT_SHIFT;
-        }
+        dequantize_channel(
+            &quant,
+            &self.layout.sfb_offsets,
+            num_sfb,
+            &scalefactors,
+            &mut self.channel.noise_seed,
+            &mut spectral,
+        );
 
         let mut out = vec![0.0f32; FRAME_LEN];
-        self.filterbank.synthesize(
+        self.channel.filterbank.synthesize(
             &spectral,
             WindowSequence::OnlyLongSequence,
             WindowShape::Sine,
             WindowShape::Sine,
-            &mut self.overlap,
+            &mut self.channel.overlap,
             &mut out,
         );
         Ok(out)
@@ -97,6 +163,84 @@ impl UsacFdDecoder {
 }
 
 impl Default for UsacFdDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One FD channel-pair element's worth of decoder state.
+pub struct UsacFdStereoDecoder {
+    layout: Layout,
+    channels: [ChannelState; 2],
+}
+
+impl UsacFdStereoDecoder {
+    pub fn new() -> Self {
+        Self { layout: Layout::new(), channels: [ChannelState::new(), ChannelState::new()] }
+    }
+
+    /// Decode one stereo frame's raw block into a `(left, right)` pair of
+    /// `FRAME_LEN` PCM sample vectors.
+    pub fn decode_frame(&mut self, reader: &mut BitReader) -> Result<(Vec<f32>, Vec<f32>)> {
+        let num_sfb = self.layout.num_sfb;
+        let mut ms_mask = vec![false; num_sfb];
+        for used in ms_mask.iter_mut() {
+            *used = reader.read_bit()?;
+        }
+
+        let mut spectral = [vec![0.0f32; FRAME_LEN], vec![0.0f32; FRAME_LEN]];
+        for (ch, spec) in self.channels.iter_mut().zip(spectral.iter_mut()) {
+            let scalefactors = read_scale_factor_data(reader, num_sfb)?;
+            let pairs = FRAME_LEN / 2;
+            let mut quant = vec![0i32; FRAME_LEN];
+            decode_pairs(reader, &mut ch.contexts, pairs, pairs, &mut quant);
+            dequantize_channel(
+                &quant,
+                &self.layout.sfb_offsets,
+                num_sfb,
+                &scalefactors,
+                &mut ch.noise_seed,
+                spec,
+            );
+        }
+
+        // Undo mid/side in place wherever the encoder used it: the
+        // transmitted pair `(m, s)` reconstructs as `(m + s, m - s)`, the
+        // same inverse `apply_ms_stereo` uses for AAC-LC
+        // (`src/decoder/aac/stereo.rs`).
+        let [mid, side] = &mut spectral;
+        for (b, &used) in ms_mask.iter().enumerate().take(num_sfb) {
+            if !used {
+                continue;
+            }
+            let lo = self.layout.sfb_offsets[b];
+            let hi = self.layout.sfb_offsets[b + 1].min(FRAME_LEN);
+            for i in lo..hi {
+                let m = mid[i];
+                let s = side[i];
+                mid[i] = m + s;
+                side[i] = m - s;
+            }
+        }
+
+        let mut out = [vec![0.0f32; FRAME_LEN], vec![0.0f32; FRAME_LEN]];
+        for ((ch, spec), o) in self.channels.iter_mut().zip(spectral.iter()).zip(out.iter_mut()) {
+            ch.filterbank.synthesize(
+                spec,
+                WindowSequence::OnlyLongSequence,
+                WindowShape::Sine,
+                WindowShape::Sine,
+                &mut ch.overlap,
+                o,
+            );
+        }
+
+        let [left, right] = out;
+        Ok((left, right))
+    }
+}
+
+impl Default for UsacFdStereoDecoder {
     fn default() -> Self {
         Self::new()
     }
