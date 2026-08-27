@@ -22,6 +22,7 @@ use crate::encoder::aac::huffman::write_scalefactor_delta;
 use crate::encoder::aac::psycho::{PsychoResult, PsychoacousticModel};
 use crate::encoder::aac::quant::{SF_OFFSET, write_band};
 use crate::encoder::aac::rate::{Quantization, RateLoop};
+use crate::encoder::aac::tns::{TnsFilter, apply as apply_tns};
 use crate::error::Result;
 use crate::syntax::adts::AdtsHeader;
 use crate::tables::scalefactor::{MAX_SFB_LONG, compute_sfb_offsets, get_sfb_table};
@@ -64,6 +65,8 @@ struct ChannelState {
     coded: Quantization,
     /// The masking model, which carries pre-echo state between frames.
     model: PsychoacousticModel,
+    /// Noise shaping applied to this frame, if any.
+    tns: Option<TnsFilter>,
 }
 
 impl ChannelState {
@@ -81,6 +84,7 @@ impl ChannelState {
             psycho: PsychoResult::default(),
             coded: Quantization::new(n, bands),
             model: PsychoacousticModel::new(sample_rate_hz, bitrate_per_channel, offsets, false),
+            tns: None,
         }
     }
 }
@@ -202,6 +206,20 @@ impl Encoder {
             for (h, &s) in ch.history.iter_mut().zip(input.iter()) {
                 *h = s as f32;
             }
+        }
+
+        // Noise shaping runs before anything measures the spectrum, because it is
+        // the shaped residual that gets quantized and that the model has to judge.
+        let rate = self.config.sampling_rate;
+        let bands = self.num_bands;
+        for ch in self.channels.iter_mut() {
+            ch.tns = apply_tns(
+                &mut ch.spectrum,
+                &self.sfb_offsets[..=bands],
+                bands.min(self.max_sfb),
+                rate,
+                false,
+            );
         }
 
         self.ms_used = false;
@@ -343,8 +361,12 @@ impl Encoder {
         if std::env::var_os("AACENC_TRACE").is_some() {
             let peak_q = ch.coded.quant.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
             let coded = ch.coded.choices.iter().filter(|c| c.codebook != 0).count();
+            let tns = match &ch.tns {
+                Some(f) => format!("order {} gain {:.2}", f.spec.order, f.gain),
+                None => "off".to_string(),
+            };
             eprintln!(
-                "enc frame {} ch {c} bits {bits}/{budget} pe {:.0} coded_bands {coded} peak_q {peak_q}",
+                "enc frame {} ch {c} bits {bits}/{budget} pe {:.0} coded_bands {coded} peak_q {peak_q} tns {tns}",
                 self.frame_count + 1,
                 ch.psycho.perceptual_entropy
             );
@@ -360,7 +382,7 @@ impl Encoder {
             1 => {
                 w.write_u8(0, 3); // SCE
                 w.write_u8(0, 4); // element instance tag
-                write_channel(w, &self.channels[0], &self.sfb_offsets, self.max_sfb);
+                write_channel(w, &self.channels[0], &self.sfb_offsets, self.max_sfb, self.num_bands);
             }
             _ => {
                 // Channels beyond the first pair are emitted as extra single
@@ -377,13 +399,13 @@ impl Encoder {
                 } else {
                     w.write_u8(0, 2); // ms_mask_present: none
                 }
-                write_channel_body(w, &self.channels[0], &self.sfb_offsets, self.max_sfb);
-                write_channel_body(w, &self.channels[1], &self.sfb_offsets, self.max_sfb);
+                write_channel_body(w, &self.channels[0], &self.sfb_offsets, self.max_sfb, self.num_bands);
+                write_channel_body(w, &self.channels[1], &self.sfb_offsets, self.max_sfb, self.num_bands);
 
                 for ch in &self.channels[2..] {
                     w.write_u8(0, 3);
                     w.write_u8(0, 4);
-                    write_channel(w, ch, &self.sfb_offsets, self.max_sfb);
+                    write_channel(w, ch, &self.sfb_offsets, self.max_sfb, self.num_bands);
                 }
             }
         }
@@ -426,16 +448,28 @@ fn write_ics_info(w: &mut BitWriter, max_sfb: usize) {
 }
 
 /// Write a whole `individual_channel_stream()` including its `ics_info`.
-fn write_channel(w: &mut BitWriter, ch: &ChannelState, offsets: &[usize], max_sfb: usize) {
+fn write_channel(
+    w: &mut BitWriter,
+    ch: &ChannelState,
+    offsets: &[usize],
+    max_sfb: usize,
+    num_swb: usize,
+) {
     w.write_u8(global_gain(ch, max_sfb), 8);
     write_ics_info(w, max_sfb);
-    write_ics_payload(w, ch, offsets, max_sfb);
+    write_ics_payload(w, ch, offsets, max_sfb, num_swb);
 }
 
 /// Write an `individual_channel_stream()` whose `ics_info` came from the element.
-fn write_channel_body(w: &mut BitWriter, ch: &ChannelState, offsets: &[usize], max_sfb: usize) {
+fn write_channel_body(
+    w: &mut BitWriter,
+    ch: &ChannelState,
+    offsets: &[usize],
+    max_sfb: usize,
+    num_swb: usize,
+) {
     w.write_u8(global_gain(ch, max_sfb), 8);
-    write_ics_payload(w, ch, offsets, max_sfb);
+    write_ics_payload(w, ch, offsets, max_sfb, num_swb);
 }
 
 /// The `global_gain` field, which the scalefactor deltas are counted from.
@@ -451,8 +485,40 @@ fn global_gain(ch: &ChannelState, max_sfb: usize) -> u8 {
     }
 }
 
+/// Write `tns_data()` for a long window carrying one filter.
+///
+/// Band ranges travel as a length counted down from the total band count, which the
+/// decoder then clips to the highest band the standard lets TNS reach. Since the
+/// filter was applied over exactly that clipped range, transmitting the whole
+/// span below its start says the same thing in fewer fields than a second,
+/// order-zero filter would.
+fn write_tns_data(w: &mut BitWriter, filter: &TnsFilter, num_swb: usize) {
+    let spec = &filter.spec;
+    let start = spec.start_band.min(num_swb);
+
+    w.write_u8(1, 2); // n_filt
+    w.write_u8(spec.resolution, 1);
+    w.write_u8((num_swb - start) as u8, 6); // length, counted down from num_swb
+    w.write_u8(spec.order as u8, 5);
+    if spec.order > 0 {
+        w.write_bit(spec.downward);
+        w.write_bit(false); // coef_compress
+        let width = spec.resolution as usize + 3;
+        let mask = (1u32 << width) - 1;
+        for i in 0..spec.order {
+            w.write_u32(spec.coef[i] as u32 & mask, width);
+        }
+    }
+}
+
 /// Write section data, scalefactors, tool flags and spectral data.
-fn write_ics_payload(w: &mut BitWriter, ch: &ChannelState, offsets: &[usize], max_sfb: usize) {
+fn write_ics_payload(
+    w: &mut BitWriter,
+    ch: &ChannelState,
+    offsets: &[usize],
+    max_sfb: usize,
+    num_swb: usize,
+) {
     // Section data: run-length runs of equal codebooks, with escape coding for
     // runs longer than the 5-bit length field can hold.
     let mut b = 0usize;
@@ -489,7 +555,13 @@ fn write_ics_payload(w: &mut BitWriter, ch: &ChannelState, offsets: &[usize], ma
     }
 
     w.write_bit(false); // pulse_data_present
-    w.write_bit(false); // tns_data_present
+    match &ch.tns {
+        Some(filter) => {
+            w.write_bit(true);
+            write_tns_data(w, filter, num_swb);
+        }
+        None => w.write_bit(false),
+    }
     w.write_bit(false); // gain_control_data_present
 
     for b in 0..max_sfb {

@@ -5,6 +5,7 @@ pub mod huffman;
 pub mod block_switch;
 pub mod psycho;
 pub mod rate;
+pub mod tns;
 pub mod quant;
 
 pub use bitstream::{
