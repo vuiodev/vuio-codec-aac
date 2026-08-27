@@ -6,6 +6,7 @@
 use crate::decoder::usac::UsacCoreMode;
 
 pub mod arith;
+pub mod fd;
 
 /// USAC Speech vs Music Classifier and Encoder Engine.
 pub struct UsacEncoder;
