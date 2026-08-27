@@ -57,6 +57,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let bench = args.bench || args.repeat > 1;
 
+    // The USAC FD path uses its own small non-ADTS container (see
+    // `decoder::usac::container`'s docs) since real ADTS cannot carry USAC's
+    // audio object type at all (its `profile` field is only 2 bits) — check for
+    // it before anything else, since its magic bytes never look like ADTS sync.
+    if vuiocodecaac::decoder::usac::container::is_usac_container(&bitstream) {
+        return decode_usac_container(&args, &bitstream, bench);
+    }
+
     if args.parallel {
         return run_parallel(&args, &bitstream, bench);
     }
@@ -144,6 +152,47 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!(
         "Decoded {} frames ({:.2}s audio in {:.3}s, speed={:.1}x real-time) -> {:?}",
         frame_count, audio_duration, elapsed, speed, args.output
+    );
+    Ok(())
+}
+
+/// Decode a stream written by `encoder::usac::container::encode` — the minimal
+/// USAC FD codec's own container, not standard ADTS (see that module's docs).
+fn decode_usac_container(
+    args: &Args,
+    bitstream: &[u8],
+    bench: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let start_time = Instant::now();
+    let decoded = vuiocodecaac::decoder::usac::container::decode(bitstream)?;
+
+    let frames = decoded.samples.len() / decoded.channels.max(1);
+    let audio_duration = frames as f64 / decoded.sample_rate_hz as f64;
+    println!(
+        "decode only: {:.2}s audio ({} channel(s) @ {} Hz, non-standard USAC FD container)",
+        audio_duration, decoded.channels, decoded.sample_rate_hz
+    );
+
+    if bench {
+        return Ok(());
+    }
+
+    let spec = hound::WavSpec {
+        channels: decoded.channels as u16,
+        sample_rate: decoded.sample_rate_hz,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut wav_writer = WavWriter::create(&args.output, spec)?;
+    for &sample in &decoded.samples {
+        wav_writer.write_sample(sample)?;
+    }
+    wav_writer.finalize()?;
+
+    let elapsed = start_time.elapsed().as_secs_f64();
+    println!(
+        "Decoded {} frames ({:.2}s audio in {:.3}s) -> {:?}",
+        frames, audio_duration, elapsed, args.output
     );
     Ok(())
 }

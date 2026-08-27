@@ -72,6 +72,42 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let samples: Vec<i16> = wav_reader.samples::<i16>().map(|s| s.unwrap_or(0)).collect();
     let num_ch = spec.channels as usize;
+
+    // The USAC FD path is a separate, minimal codec (see
+    // `encoder::usac::container`'s docs) with its own non-ADTS framing, so it
+    // takes its own path through this binary rather than joining the AAC-LC/
+    // SBR/PS encode loop below.
+    if aot == AudioObjectType::Usac {
+        // The USAC FD rate loop's bit budget is per channel per frame, unlike
+        // `bitrate_bps` which is the whole stream's bits per second; converting
+        // keeps `--bitrate` meaning roughly the same thing across profiles.
+        let budget_bits =
+            ((args.bitrate as u64 * 1024 / spec.sample_rate as u64) / num_ch as u64) as usize;
+        let bytes = vuiocodecaac::encoder::usac::container::encode(
+            &samples,
+            num_ch,
+            spec.sample_rate,
+            budget_bits,
+        )?;
+        let out_file = File::create(&args.output)?;
+        let mut buf_writer = BufWriter::with_capacity(65536, out_file);
+        buf_writer.write_all(&bytes)?;
+        buf_writer.flush()?;
+
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let total_frames = samples.len().div_ceil(num_ch * 1024);
+        let audio_duration = (total_frames * 1024) as f64 / spec.sample_rate as f64;
+        println!(
+            "Encoded {} frames ({:.2}s audio in {:.3}s, profile: Usac (non-standard container), {} kbps) -> {:?}",
+            total_frames,
+            audio_duration,
+            elapsed,
+            args.bitrate / 1000,
+            args.output
+        );
+        return Ok(());
+    }
+
     let frame_len = 1024;
     let frame_stride = num_ch * frame_len;
     let total_frames = samples.len() / frame_stride;

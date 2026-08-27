@@ -6,6 +6,7 @@
 use crate::decoder::usac::UsacCoreMode;
 
 pub mod arith;
+pub mod container;
 pub mod fd;
 pub mod tns;
 

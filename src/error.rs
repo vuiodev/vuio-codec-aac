@@ -159,6 +159,9 @@ pub enum FormatError {
 
     #[error("Unrecognized stream container format")]
     UnrecognizedContainer,
+
+    #[error("Invalid USAC FD container: {0}")]
+    InvalidUsacContainer(String),
 }
 
 /// Errors occurring in DSP transforms or filterbanks.

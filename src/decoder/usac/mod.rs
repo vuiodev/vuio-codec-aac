@@ -9,6 +9,7 @@ use crate::dsp::lpc::lpc_synthesis_filter;
 use crate::error::Result;
 
 pub mod arith;
+pub mod container;
 pub mod fd;
 
 /// Core coding mode for a USAC audio frame.
