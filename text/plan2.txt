@@ -1,0 +1,15 @@
+Survey of what's actually missing vs. c/libxaac: the AAC-LC/HE-AAC v1/v2 (SBR+PS) path is close to parity — I checked, and the
+  C encoder itself doesn't implement PNS, intensity stereo, or pulse coding either, so those aren't real gaps. The genuine, large
+  gaps are all in the USAC/xHE-AAC layer, and they're bigger than they look:
+  - src/decoder/usac and src/encoder/usac are non-functional placeholders today, not real implementations (the ACELP decoder
+    ignores its bitstream reader; the TCX decoder just linearly scales integers instead of running an inverse transform), despite
+    their doc comments claiming otherwise.
+  - Real USAC needs: a context-adaptive arithmetic coder for spectral data (the foundation everything else sits on), ACELP+TCX
+    speech coding, MPEG Surround multichannel encoding, complex-prediction stereo, and enhanced-SBR extensions. 
+  - Separately, DRC is also smaller in Rust than in C: what's implemented is the older, simple dynamic_range_info() element,
+    while the C codebase has a full ~8,000-line MPEG-D Unified DRC encoder (gain calculator, multiband EQ, config muxing).
+
+  I've dispatched a background agent to port the USAC spectral arithmetic coder first, since it's the foundational piece
+  everything else in USAC depends on — real algorithm and tables from ixheaacd_arith_dec.c/iusace_arith_enc.c, not a simplified
+  stand-in, with round-trip tests. I'll review its diff carefully and integrate it once it lands, then keep working down the list
+  (ACELP/TCX, MPS encoder, or uniDrc — whichever makes sense to sequence next). I'll report back when that's done.

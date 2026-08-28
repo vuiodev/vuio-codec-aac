@@ -13,7 +13,7 @@
 //! is cheaper. Block switching for transients and temporal noise shaping are not
 //! wired in yet.
 
-use crate::bitstream::BitWriter;
+use crate::bitstream::{BitReader, BitWriter};
 use crate::buffer::AudioBuffer;
 use crate::dsp::fft::Complex32;
 use crate::dsp::mdct::MdctContext;
@@ -25,11 +25,41 @@ use crate::encoder::aac::quant::{SF_OFFSET, write_band};
 use crate::encoder::aac::rate::{Quantization, RateLoop};
 use crate::encoder::aac::tns::{TnsFilter, apply as apply_tns};
 use crate::error::Result;
+use crate::syntax::adif::AdifHeader;
 use crate::syntax::adts::AdtsHeader;
+use crate::syntax::asc::AudioSpecificConfig;
 use crate::tables::scalefactor::{MAX_SFB_LONG, compute_sfb_offsets, get_sfb_table};
 use crate::types::{
     AudioObjectType, ChannelConfiguration, FrameLength, SamplingRate, WindowSequence, WindowShape,
 };
+
+/// Which container framing [`Encoder`] wraps each `raw_data_block()` in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    /// A self-framing header on every frame -- the default, and what every
+    /// existing caller of this encoder already gets.
+    #[default]
+    Adts,
+    /// One header before the very first frame (carrying this stream's
+    /// [`AudioSpecificConfig`] as its single program config element,
+    /// [`crate::syntax::adif::AdifHeader`]'s own convention -- see that
+    /// module's docs), then bare `raw_data_block()`s with no per-frame
+    /// framing at all -- the first joined to the header bit for bit, since
+    /// the header's own length is not generally byte-aligned.
+    ///
+    /// Each call to [`Encoder::encode_frame`]/[`Encoder::flush`] still
+    /// returns one frame's bytes at a time (the first carrying the header, so
+    /// it is larger than the rest), exactly like [`OutputFormat::Adts`]; feed
+    /// each returned chunk to [`crate::decoder::engine::Decoder::decode_frame`]
+    /// in turn (it already reads this shape end to end, phase 0.5) and it
+    /// round-trips. Concatenating every chunk into one continuous file also
+    /// produces a real, spec-shaped ADIF stream for other decoders -- but
+    /// note that a *continuous, un-chunked* read of that file is not
+    /// something `Decoder::decode_frame` supports today: each call still
+    /// consumes exactly one `raw_data_block()` from the bytes it is given,
+    /// never "the rest of the reader".
+    Adif,
+}
 
 /// Encoder configuration.
 #[derive(Debug, Clone)]
@@ -39,6 +69,7 @@ pub struct EncoderConfig {
     pub channel_config: ChannelConfiguration,
     pub bitrate_bps: u32,
     pub frame_length: FrameLength,
+    pub output_format: OutputFormat,
 }
 
 impl Default for EncoderConfig {
@@ -49,6 +80,7 @@ impl Default for EncoderConfig {
             channel_config: ChannelConfiguration::Stereo,
             bitrate_bps: 128_000,
             frame_length: FrameLength::Samples1024,
+            output_format: OutputFormat::default(),
         }
     }
 }
@@ -157,6 +189,9 @@ pub struct Encoder {
     coding_offsets: [usize; MAX_BANDS + 1],
     /// Bands in [`Self::coding_offsets`].
     coding_bands: usize,
+    /// Set once the one-time ADIF header has been emitted, in
+    /// [`OutputFormat::Adif`]; irrelevant otherwise.
+    adif_header_written: bool,
 }
 
 impl Encoder {
@@ -228,6 +263,7 @@ impl Encoder {
             },
             coding_offsets,
             coding_bands: num_bands.min(MAX_BANDS),
+            adif_header_written: false,
         })
     }
 
@@ -704,24 +740,81 @@ impl Encoder {
         w.byte_align_zero();
         let payload = w.as_bytes().to_vec();
 
-        // Prepend the ADTS header now that the payload length is known.
-        let header = AdtsHeader {
-            mpeg_id: 0,
-            layer: 0,
-            protection_absent: true,
-            audio_object_type: self.config.audio_object_type,
-            sampling_rate: self.config.sampling_rate,
-            channel_config: self.config.channel_config,
-            frame_length: payload.len() + 7,
-            buffer_fullness: 0x7FF,
-            num_raw_data_blocks: 0,
-            crc: None,
+        let mut frame = match self.config.output_format {
+            OutputFormat::Adts => {
+                // Prepend the ADTS header now that the payload length is known.
+                let header = AdtsHeader {
+                    mpeg_id: 0,
+                    layer: 0,
+                    protection_absent: true,
+                    audio_object_type: self.config.audio_object_type,
+                    sampling_rate: self.config.sampling_rate,
+                    channel_config: self.config.channel_config,
+                    frame_length: payload.len() + 7,
+                    buffer_fullness: 0x7FF,
+                    num_raw_data_blocks: 0,
+                    crc: None,
+                };
+                let mut head = BitWriter::with_capacity(8);
+                header.write(&mut head);
+                head.byte_align_zero();
+                head.into_bytes()
+            }
+            OutputFormat::Adif => {
+                // One header before the first frame only; every frame after
+                // that is the bare raw_data_block() with no framing of its
+                // own, exactly what Decoder::decode_frame expects to follow
+                // an ADIF header (see OutputFormat::Adif's docs).
+                if self.adif_header_written {
+                    Vec::new()
+                } else {
+                    self.adif_header_written = true;
+                    let asc = AudioSpecificConfig {
+                        audio_object_type: self.config.audio_object_type,
+                        sampling_rate: self.config.sampling_rate,
+                        channel_config: self.config.channel_config,
+                        frame_length: self.config.frame_length,
+                        depends_on_core_coder: false,
+                        core_coder_delay: 0,
+                        extension_audio_object_type: None,
+                        extension_sampling_rate: None,
+                        sbr_present: false,
+                        ps_present: false,
+                    };
+                    let header = AdifHeader {
+                        copyright_id_present: false,
+                        copyright_id: [0u8; 9],
+                        original_copy: false,
+                        home: false,
+                        bitstream_type: true, // variable rate: no buffer_fullness field
+                        bitrate: self.config.bitrate_bps,
+                        num_program_config_elements: 1,
+                        buffer_fullness: 0,
+                        configs: vec![asc],
+                    };
+                    // The header's own bit length is not generally a multiple
+                    // of 8, so the first frame's payload bits have to be
+                    // packed on immediately after it in the same bitstream --
+                    // byte-aligning the header first and concatenating bytes
+                    // would insert padding a real ADIF stream (and this
+                    // crate's own decoder, which does not skip any) does not
+                    // expect. Every frame after this one already starts and
+                    // ends on a byte boundary on its own (this encoder always
+                    // byte-aligns a raw_data_block's payload), so only this
+                    // one join has to happen bit by bit rather than
+                    // byte by byte.
+                    let mut head = BitWriter::with_capacity(payload.len() + 16);
+                    header.write(&mut head);
+                    let mut payload_bits = BitReader::new(&payload);
+                    for _ in 0..payload.len() * 8 {
+                        head.write_bit(payload_bits.read_bit().expect("just-written payload"));
+                    }
+                    head.byte_align_zero();
+                    self.frame_count += 1;
+                    return Ok(head.into_bytes());
+                }
+            }
         };
-        let mut head = BitWriter::with_capacity(8);
-        header.write(&mut head);
-        head.byte_align_zero();
-
-        let mut frame = head.into_bytes();
         frame.extend_from_slice(&payload);
         self.frame_count += 1;
         Ok(frame)
@@ -1065,6 +1158,61 @@ mod tests {
         for frame in frames.iter().filter(|f| !f.is_empty()) {
             assert!(frame.len() > 20, "mono frame too small: {}", frame.len());
         }
+    }
+
+    /// `OutputFormat::Adif` must produce a real, decodable stream: exactly one
+    /// header (joined to the first frame bit for bit, not byte-aligned into
+    /// it), every later frame bare, and every chunk decodes back through this
+    /// crate's own `Decoder` -- including reconfiguring itself from the
+    /// header the way a real player encountering this stream cold would.
+    #[test]
+    fn adif_output_round_trips_through_the_real_decoder() {
+        use crate::decoder::engine::Decoder;
+        use crate::syntax::asc::AudioSpecificConfig;
+
+        let config = EncoderConfig { output_format: OutputFormat::Adif, ..Default::default() };
+        let mut enc = Encoder::new(config).unwrap();
+        let mut chunks = Vec::new();
+        for f in 0..4 {
+            let pcm = tone(2, 1024, 440.0, 44100.0, f * 1024);
+            chunks.push(enc.encode_frame(&pcm).unwrap());
+        }
+        chunks.push(enc.flush().unwrap());
+        let chunks: Vec<_> = chunks.into_iter().filter(|c| !c.is_empty()).collect();
+        assert!(chunks.len() >= 4, "expected several real frames, got {}", chunks.len());
+
+        // The first chunk must start with the ADIF syncword and be larger
+        // than a bare frame; later chunks must NOT carry another header.
+        assert_eq!(u32::from_be_bytes(chunks[0][..4].try_into().unwrap()), AdifHeader::SYNCWORD);
+        for later in &chunks[1..] {
+            assert_ne!(
+                u32::from_be_bytes(later[..4.min(later.len())].try_into().unwrap_or([0; 4])),
+                AdifHeader::SYNCWORD,
+                "only the first chunk may carry the ADIF header"
+            );
+        }
+
+        // A cold decoder, deliberately mis-configured, must reconfigure
+        // itself from the header on the very first chunk (mirroring
+        // `an_adif_prefixed_stream_decodes_and_reconfigures`) and then decode
+        // every remaining bare chunk without any special handling.
+        let mut dec = Decoder::new(AudioSpecificConfig {
+            audio_object_type: AudioObjectType::AacLc,
+            sampling_rate: SamplingRate::Hz16000,
+            channel_config: ChannelConfiguration::Mono,
+            frame_length: FrameLength::Samples1024,
+            depends_on_core_coder: false,
+            core_coder_delay: 0,
+            extension_audio_object_type: None,
+            extension_sampling_rate: None,
+            sbr_present: false,
+            ps_present: false,
+        });
+        for chunk in &chunks {
+            dec.decode_frame(chunk).expect("every ADIF-framed chunk must decode");
+        }
+        assert_eq!(dec.channels(), 2, "must have reconfigured to stereo from the ADIF header");
+        assert_eq!(dec.sample_rate_hz(), SamplingRate::Hz44100.hz());
     }
 
     /// Silence must still produce valid frames, and small ones.

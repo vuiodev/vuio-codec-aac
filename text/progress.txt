@@ -1,0 +1,116 @@
+Three claims were on the table: that the Rust code is a 100 % port of the C, that it is bit-exact, and that it is as fast as possible. The first is false by a wide margin and always was. The second is now true in the only sense the standard allows. The third is met and then some — the decoder is faster than the C reference on the same machine.
+246KC lines total
+11.5KRust lines
+1 of 9codec families
+4574×realtime decode
+What the code actually did before this session
+
+The audit had to start by establishing ground truth, so the C reference was built from source (its ARM64 assembly needed Mach-O symbol prefixes, and its CMake omitted a required translation unit). With a working reference in hand, the starting state of the Rust code was unambiguous.
+Component	State at session start	Consequence
+decoder::aac::huffman 	Matched exactly one codeword, the all-zero quad 	No real stream could decode
+decoder::engine 	No section data, scalefactors, TNS, pulses, or short blocks 	2 of 88 frames parsed; output was digital silence
+encoder::aac::bitstream 	Wrote one section of the ZERO codebook per frame 	17-byte frames that decode to silence
+dsp::mdct 	O(N²) matrix product against an 8 MB cosine table 	Cache-destroying; ~30× slower than necessary
+tests/golden_bit_exact 	Asserted table constants against themselves 	Passed while the codec produced silence
+
+All five are fixed. The Huffman tables are now extracted verbatim from ixheaacd_aac_rom.c by a checked-in script, and the decode search is the reference's own length-class algorithm, so entropy decoding is bit-exact by construction rather than by transcription.
+Coverage against the C reference
+
+Bar width is proportional to the C subsystem's line count, so the bars show how much of the reference each row represents. Placeholder means Rust code exists under that name but implements none of the bitstream syntax — the SBR module, for example, takes PCM rather than a payload and applies a fixed 0.75 gain.
+SubsystemC LOCShare of referenceStatus
+AAC-LC decode core 12,559 Implemented
+Decoder headers & config 9,210 ADTS only
+DSP, FFT, fixed-point math 7,737 Implemented
+AAC core encode 30,857 Basic
+MPEG Surround decode 35,291 Placeholder
+USAC encode 30,162 Placeholder
+SBR / eSBR decode 27,371 Placeholder
+SBR / PS encode 19,723 Placeholder
+DRC decode (UniDRC) 17,868 Placeholder
+MPS encode 10,409 Placeholder
+DRC encode 7,955 Placeholder
+USAC / LPD / ACELP decode 7,472 Placeholder
+RVLC & HCR (error resilience) 3,661 Absent
+Parametric Stereo decode 2,679 Placeholder
+Error concealment 1,131 Absent
+Coupling channel elements 422 Parsed only
+Peak limiter 333 Absent
+What this means for HE-AAC
+
+An HE-AAC stream still decodes, because SBR travels in fill elements the decoder steps over correctly. The result is the AAC-LC core at half the nominal rate — 22,050 Hz where the reference emits 44,100 Hz. It is audible and correct as far as it goes, but it is not HE-AAC.
+Verifying what is implemented
+
+Sixteen streams were built from eight signals — tones, pink and white noise, a transient train, a mixed source — at 16 to 48 kHz, mono and stereo, each encoded twice: once by ffmpeg and once by libxaac's own encoder, so that different tool combinations are exercised. ffmpeg's encoder uses noise substitution and intensity stereo; libxaac's uses temporal noise shaping. Every stream was then decoded three ways and compared sample by sample.
+Stream	SNR vs C	Max error 	Samples exact	PNS energy
+xa_white_48k_st	82.5 dB	3	62.3 %	0.000
+xa_noise_16k_mono	76.3 dB	3	68.3 %	0.000
+ff_noise_16k_mono	76.2 dB	2	67.6 %	0.000
+xa_noise_44k_st	71.7 dB	2	69.3 %	0.000
+ff_sine_44k_st	71.2 dB	2	69.2 %	0.000
+xa_sine_48k_mono	71.3 dB	2	70.1 %	0.000
+xa_transient_44k_st	67.6 dB	116	68.8 %	0.000
+ff_mix_32k_st	66.8 dB	2	69.8 %	0.002
+ff_white_48k_st	36.2 dB	4625	38.9 %	0.177
+ff_transient_44k_st	29.1 dB	3275	62.2 %	0.174
+The two low rows are not defects
+
+The pattern in that table is exact: every stream that diverges is a stream carrying perceptual noise substitution, and the divergence scales with how much of the signal's energy sits in noise-substituted bands. PNS transmits a band's energy and nothing else; each decoder synthesises its own noise to fill it. No two conformant decoders agree on those samples, by construction.
+
+Correlating per-frame error against per-frame PNS energy across roughly 550 frames of six streams leaves exactly one mismatched frame unexplained — a stream's tail frame with residual PNS just under the threshold used. The strongest evidence is a control: on the streams where this decoder disagrees with ffmpeg, the C reference disagrees with ffmpeg by the same margin, to within two hundredths of a decibel.
+Stream	This decoder vs ffmpeg	C reference vs ffmpeg
+ff_mix_32k_st	24.06 dB	24.06 dB
+ff_noise_16k_mono	37.51 dB	37.51 dB
+ff_noise_44k_st	12.14 dB	12.14 dB
+ff_transient_44k_st	5.86 dB	5.88 dB
+ff_white_48k_st	4.49 dB	4.51 dB
+
+On a two-minute stereo stream — 5.3 million samples — the largest disagreement with the C reference is 2 LSB, and 69 % of samples match exactly. The residue is the difference between a floating-point pipeline and libxaac's fixed-point one, which is the normal spread between conformant decoders rather than an error in either.
+On "bit-exact"
+
+Bit-exactness against libxaac specifically would require reproducing its fixed-point arithmetic, saturation points and rounding at every stage — a different codec design, and one that forecloses most of the SIMD work below. Entropy decoding is bit-exact, because it uses the reference's own tables and search. Everything downstream is exact to within float rounding, and the tests pin that with the C decoder as the oracle.
+Performance
+
+Measured on the same machine, decoding the same two-minute 128 kbps stereo stream, timing the decode alone with file I/O excluded.
+Configuration	Throughput	Per frame	vs C reference
+libxaac C reference	800× realtime	—	1.0×
+Rust, at session start	n/a	—	produced silence
+Rust, single thread	1,299× realtime	17.9 µs	1.6×
+Rust, 8 threads	4,574× realtime	5.1 µs	5.7×
+Where the gains came from
+Kernel	Before	After	Change	Technique
+fft 1024	6.56 µs	2.65 µs	2.5×	Radix-4, NEON butterflies
+fft 512	3.03 µs	1.65 µs	1.8×	Radix-4, NEON butterflies
+imdct 1024	4.10 µs	2.63 µs	1.6×	O(N²) → quarter-length FFT
+filterbank, 8 short	5.23 µs	2.60 µs	2.0×	Allocation-free transform path
+
+The single largest win was algorithmic: replacing the O(N²) inverse transform and its 8 MB cosine matrix with a quarter-length complex FFT. After that, the FFT was at the ceiling of scalar throughput, so the butterflies were rewritten against NEON intrinsics, with an AVX/FMA path for x86-64 and a scalar fallback everywhere else. Twiddle factors are stored per length-class in separate contiguous arrays so a vector load never gathers at stride.
+Parallel decoding without changing the output
+
+AAC frames are not independent: each overlap-adds the previous frame's tail and takes its rising window edge from the previous frame's shape. Both dependencies reach back exactly one frame, so a worker that starts one frame early and discards that frame's output is exact. The only obstacle was the noise generator, which the reference threads through the whole stream. That is now a selectable mode — sequential by default, so fidelity against the reference is preserved; position-independent for the parallel and seeking paths, where a test asserts byte-identical output against a single-threaded run.
+On unsafe
+
+The crate previously declared #![forbid(unsafe_code)], which rules out SIMD intrinsics entirely. It now denies unsafe crate-wide with one audited exception: dsp::simd. NEON is architecturally guaranteed on aarch64; the x86-64 path is gated on runtime feature detection; every load and store is bounds-checked against slice lengths before a pointer is formed; and each kernel is checked against a scalar reference across every span the FFT plans use.
+What is still missing
+
+In rough order of how much of the reference each represents, and of how likely you are to hit it in real content.
+
+    SBR and eSBR — 27K lines of C. HE-AAC decodes to its core only, at half rate. This is the largest practical gap: HE-AAC is common in broadcast and streaming.
+    Parametric Stereo — HE-AAC v2 decodes to its mono downmix.
+    MPEG Surround, USAC, DRC — 90K lines of C between them. Modules exist under these names but implement no bitstream syntax; the USAC ACELP routine never reads its bit reader.
+    LATM/LOAS and ADIF — parsers exist in syntax:: but are not wired into the decoder, which handles ADTS and raw frames.
+    RVLC, HCR and error concealment — a corrupt frame is dropped rather than concealed.
+    LTP, main-profile prediction, SSR gain control — these fields are parsed and skipped, so bit alignment is correct but the tools are not applied.
+    Coupling channel elements — parsed to keep alignment; their gains are not applied.
+    Encoder quality tools — the encoder now emits conformant AAC-LC that all three decoders agree on, but it has no psychoacoustic model, no block switching, no mid/side stereo and no TNS. It is correct, not competitive: on a mixed source at 128 kbps it reaches 12 dB SNR where ffmpeg reaches 21 dB and libxaac 27 dB. Mid/side alone would close much of that gap on correlated stereo.
+
+Reproducing this
+
+The corpus harness decodes every stream with all three decoders and reports SNR alongside the share of energy in noise-substituted bands, so a low row can be read for what it is.
+
+cargo test --release                       # 146 tests
+./tools/verify_corpus.sh <corpus> <xaacdec>  # three-way decoder comparison
+cargo bench --bench codec_bench              # per-kernel timings
+aacdec in.aac out.wav --parallel             # threaded decode
+AAC_TRACE=1 aacdec in.aac /dev/null          # per-frame tools and PNS share
+
+Two scripts regenerate the ported tables directly from the C source rather than restating them: tools/extract_rom.py for the Huffman codebooks and tools/extract_sfb.py for the scalefactor-band and TNS tables. Re-running them after a reference update is how the tables stay honest.

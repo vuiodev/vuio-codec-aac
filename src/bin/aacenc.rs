@@ -39,6 +39,11 @@ struct Args {
     /// Number of worker threads for parallel multi-threaded encoding (0 = auto)
     #[arg(short, long, default_value_t = 0)]
     threads: usize,
+
+    /// Write a single ADIF header followed by bare raw_data_block()s instead
+    /// of an ADTS header on every frame
+    #[arg(long, default_value_t = false)]
+    adif: bool,
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -68,6 +73,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         channel_config,
         bitrate_bps: args.bitrate,
         frame_length: FrameLength::Samples1024,
+        output_format: if args.adif { OutputFormat::Adif } else { OutputFormat::Adts },
     };
 
     let samples: Vec<i16> = wav_reader.samples::<i16>().map(|s| s.unwrap_or(0)).collect();

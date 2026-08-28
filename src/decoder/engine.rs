@@ -152,6 +152,14 @@ pub struct Decoder {
     /// delay shifts every output sample by a few milliseconds, which a caller
     /// who did not ask for it should not get silently.
     peak_limiter: Option<crate::dsp::peak_limiter::PeakLimiter>,
+    /// Per-coupling-channel overlap-add state, keyed by the CCE's own
+    /// `element_instance_tag` rather than decode order -- a CCE is not one of
+    /// `self.channels` and can appear or disappear frame to frame, so its
+    /// filterbank tail has to persist under a stable key instead of a slot
+    /// index. See [`Self::mix_coupling_channels`] and `text/plan.txt` phase 7.5.
+    cce_overlap: std::collections::HashMap<u8, (Vec<f32>, WindowShape)>,
+    /// See [`Self::enable_downmix_to_stereo`]; off by default.
+    downmix_to_stereo: bool,
 }
 
 impl Decoder {
@@ -177,6 +185,8 @@ impl Decoder {
             sbr_scratch: Vec::new(),
             drc: DrcDecoder::default(),
             peak_limiter: None,
+            cce_overlap: std::collections::HashMap::new(),
+            downmix_to_stereo: false,
         }
     }
 
@@ -223,6 +233,55 @@ impl Decoder {
     /// Whether the peak limiter is currently engaged.
     pub fn peak_limiter_enabled(&self) -> bool {
         self.peak_limiter.is_some()
+    }
+
+    /// Fold a multichannel stream down to stereo output using the reference's
+    /// fixed downmix matrix (`decoder::aac::downmix`), for output devices that
+    /// cannot render more than two channels.
+    ///
+    /// Off by default, like the peak limiter and DRC. Only takes effect on a
+    /// frame whose `channelConfiguration` implicitly declares one of the four
+    /// layouts [`crate::decoder::aac::downmix::Layout`] covers (5.0/5.1/7.0/7.1
+    /// with no `program_config_element()` overriding it -- see
+    /// [`Self::downmix_layout`]); any other channel count decodes and outputs
+    /// unchanged, exactly as if this were never called. That is a real, if
+    /// narrower-than-libxaac, scope: the reference additionally resolves a
+    /// PCE's own declared channel roles via `slot_element[]`, which this
+    /// decoder does not track (`text/plan.txt` phase 7.6).
+    pub fn enable_downmix_to_stereo(&mut self) {
+        self.downmix_to_stereo = true;
+    }
+
+    /// Turn multichannel-to-stereo downmixing back off.
+    pub fn disable_downmix_to_stereo(&mut self) {
+        self.downmix_to_stereo = false;
+    }
+
+    /// Whether downmixing is currently enabled (not whether the last frame
+    /// actually had a channel count it applies to).
+    pub fn downmix_to_stereo_enabled(&self) -> bool {
+        self.downmix_to_stereo
+    }
+
+    /// The fixed downmix layout this decoder's current implicit channel
+    /// configuration resolves to, if any.
+    ///
+    /// Only the three implicit (PCE-less) configurations whose element decode
+    /// order the standard fixes are covered: `FiveChannel` (5.0),
+    /// `FivePointOne` (5.1) and `SevenPointOne` (7.1, which is what
+    /// `ChannelConfiguration::SevenPointOne` denotes despite the name reusing
+    /// "seven" -- MPEG-4's own table). `Layout::Ch7_0` has no implicit
+    /// `channelConfiguration` value at all (7 discrete channels with no LFE
+    /// only exists behind an explicit PCE this decoder does not role-map), so
+    /// it is unreachable from here by construction, not an oversight.
+    fn downmix_layout(&self) -> Option<crate::decoder::aac::downmix::Layout> {
+        use crate::decoder::aac::downmix::Layout;
+        match self.config.channel_config {
+            ChannelConfiguration::FiveChannel => Some(Layout::Ch5_0),
+            ChannelConfiguration::FivePointOne => Some(Layout::Ch5_1),
+            ChannelConfiguration::SevenPointOne => Some(Layout::Ch7_1),
+            _ => None,
+        }
     }
 
     /// Create a default stereo AAC-LC decoder at 44.1 kHz.
@@ -409,25 +468,73 @@ impl Decoder {
             limiter.process(&mut slots);
         }
 
-        let frame_len = self.frame_length();
-        if self.output_pcm.channels() != self.active_channels
-            || self.output_pcm.samples_per_channel() != frame_len
-        {
-            self.output_pcm.resize(self.active_channels, frame_len);
-        }
-
-        // Convert to interleaved 16-bit PCM with saturation.
-        for ch in 0..self.active_channels {
-            let src: &[f32] =
-                if self.sbr_active { &self.channels[ch].sbr_pcm } else { &self.channels[ch].pcm };
-            let dst = self.output_pcm.channel_mut(ch);
-            for (out, &v) in dst.iter_mut().zip(src.iter()) {
-                *out = clamp_to_i16(v);
-            }
-        }
+        self.write_output_pcm();
 
         self.frame_count += 1;
         Ok(&self.output_pcm)
+    }
+
+    /// Convert this frame's decoded channels to interleaved 16-bit PCM in
+    /// [`Self::output_pcm`], applying the fixed multichannel downmix first
+    /// when [`Self::enable_downmix_to_stereo`] is on and this frame's channel
+    /// configuration and count actually resolve to one of its layouts.
+    ///
+    /// Factored out of [`Self::decode_frame`] so the downmix decision and the
+    /// decode-order permutation it applies can be exercised directly against
+    /// hand-set channel state, without needing a real multichannel bitstream
+    /// (this crate's own encoder does not emit PCE-declared multichannel
+    /// streams to decode one from).
+    fn write_output_pcm(&mut self) {
+        let frame_len = self.frame_length();
+
+        // Only takes effect when this frame's implicit channel configuration
+        // resolves to one of the four fixed-matrix layouts AND actually
+        // produced that many channels -- anything else (stereo, a PCE this
+        // decoder does not role-map, an SBR-widened count that no longer
+        // matches) falls through to plain per-channel output unchanged.
+        let downmix_layout = self
+            .downmix_to_stereo
+            .then(|| self.downmix_layout())
+            .flatten()
+            .filter(|l| l.channels() == self.active_channels);
+
+        if let Some(layout) = downmix_layout {
+            let order = downmix_decode_order(layout);
+            let refs: Vec<&[f32]> = order
+                .iter()
+                .map(|&i| {
+                    let ch = &self.channels[i];
+                    if self.sbr_active { ch.sbr_pcm.as_slice() } else { ch.pcm.as_slice() }
+                })
+                .collect();
+            let (left, right) = crate::decoder::aac::downmix::downmix_to_stereo(layout, &refs);
+
+            if self.output_pcm.channels() != 2 || self.output_pcm.samples_per_channel() != frame_len {
+                self.output_pcm.resize(2, frame_len);
+            }
+            for (out, &v) in self.output_pcm.channel_mut(0).iter_mut().zip(left.iter()) {
+                *out = clamp_to_i16(v);
+            }
+            for (out, &v) in self.output_pcm.channel_mut(1).iter_mut().zip(right.iter()) {
+                *out = clamp_to_i16(v);
+            }
+        } else {
+            if self.output_pcm.channels() != self.active_channels
+                || self.output_pcm.samples_per_channel() != frame_len
+            {
+                self.output_pcm.resize(self.active_channels, frame_len);
+            }
+
+            // Convert to interleaved 16-bit PCM with saturation.
+            for ch in 0..self.active_channels {
+                let src: &[f32] =
+                    if self.sbr_active { &self.channels[ch].sbr_pcm } else { &self.channels[ch].pcm };
+                let dst = self.output_pcm.channel_mut(ch);
+                for (out, &v) in dst.iter_mut().zip(src.iter()) {
+                    *out = clamp_to_i16(v);
+                }
+            }
+        }
     }
 
     /// Adopt new stream parameters, rebuilding size-dependent state if needed.
@@ -451,6 +558,14 @@ impl Decoder {
         let mut next_channel = 0usize;
         let mut sbr_target: Option<SbrTarget> = None;
         self.elements.clear();
+        // `element_instance_tag -> (first channel index, channel count)` for
+        // every SCE/CPE/LFE decoded this frame, so a CCE's target list (which
+        // names channels by tag, not by decode order) can be resolved once
+        // all of them are known. Cleared and rebuilt every frame: a tag's
+        // meaning is only valid within the raw_data_block that declared it.
+        let mut tag_channels: std::collections::HashMap<u8, (usize, usize)> =
+            std::collections::HashMap::new();
+        let mut pending_cce: Vec<CouplingChannelElement> = Vec::new();
 
         while reader.bits_remaining() >= 3 {
             let Some(element) = ElementType::from_u8(reader.read_u8(3)?) else {
@@ -467,7 +582,8 @@ impl Decoder {
                             Some(SbrTarget { element: self.elements.len(), kind: SbrElement::Single });
                     }
                     self.elements.push((next_channel, 1));
-                    let _tag = reader.read_u8(4)?;
+                    let tag = reader.read_u8(4)?;
+                    tag_channels.insert(tag, (next_channel, 1));
                     let mut rng = self.take_noise_rng(next_channel);
                     let ch = &mut self.channels[next_channel];
                     decode_ics(reader, &mut ch.data, rate, frame_length, aot, None)?;
@@ -484,7 +600,8 @@ impl Decoder {
                     sbr_target =
                         Some(SbrTarget { element: self.elements.len(), kind: SbrElement::Pair });
                     self.elements.push((next_channel, 2));
-                    let _tag = reader.read_u8(4)?;
+                    let tag = reader.read_u8(4)?;
+                    tag_channels.insert(tag, (next_channel, 2));
                     let common_window = reader.read_bit()?;
 
                     let shared: Option<IcsInfo> = if common_window {
@@ -539,12 +656,12 @@ impl Decoder {
                 }
 
                 ElementType::Cce => {
-                    // Decoded for real: its spectral data, target list and
-                    // per-target gains. What is not yet done is mixing the
-                    // result into the target channels' PCM -- see
-                    // CouplingChannelElement's docs for why, and text/plan.txt
-                    // phase 7.5.
-                    let _cce = CouplingChannelElement::parse(reader, rate, frame_length, aot)?;
+                    // Its own spectrum decodes now, same as any other channel;
+                    // mixing it into its targets' PCM has to wait until every
+                    // SCE/CPE this frame has been both tag-mapped (just above)
+                    // and filterbank-synthesized (only after the loop ends),
+                    // so it is queued rather than applied here.
+                    pending_cce.push(CouplingChannelElement::parse(reader, rate, frame_length, aot)?);
                 }
 
                 ElementType::Dse => skip_data_stream_element(reader)?,
@@ -566,7 +683,71 @@ impl Decoder {
         }
 
         self.synthesize(next_channel);
+        self.mix_coupling_channels(pending_cce, &tag_channels, next_channel);
         Ok(next_channel)
+    }
+
+    /// Run each queued [`CouplingChannelElement`] through its own persistent
+    /// filterbank state and scale-and-add the result into every target its
+    /// tag list resolves to (`ixheaacd_dec_couple_channel`, applied once the
+    /// real target mapping is known -- see `text/plan.txt` phase 7.5).
+    ///
+    /// A target tag this frame's SCE/CPE/LFE elements never declared is
+    /// skipped rather than an error: a coupling channel naming a target that
+    /// is not present in this particular raw_data_block is a real (if
+    /// malformed) case a decoder has to tolerate, not something to fail the
+    /// whole frame over when everything else decoded cleanly.
+    fn mix_coupling_channels(
+        &mut self,
+        pending: Vec<CouplingChannelElement>,
+        tag_channels: &std::collections::HashMap<u8, (usize, usize)>,
+        active_channels: usize,
+    ) {
+        let rate = self.config.sampling_rate;
+        for mut cce in pending {
+            let (overlap, prev_shape) =
+                self.cce_overlap.entry(cce.tag).or_insert_with(|| (vec![0.0; cce.data.spec.len()], WindowShape::Sine));
+            if overlap.len() != cce.data.spec.len() {
+                *overlap = vec![0.0; cce.data.spec.len()];
+            }
+            let mut coupling_pcm = vec![0.0f32; cce.data.spec.len()];
+            Self::synthesize_channel_data(
+                &mut self.filterbank,
+                &mut self.deinterleave_scratch,
+                rate,
+                &mut cce.data,
+                overlap,
+                prev_shape,
+                &mut coupling_pcm,
+            );
+
+            // Mirrors `CouplingChannelElement::parse`'s own `num_gain` count
+            // exactly: two gains only for a channel-pair target coupled on
+            // both channels, one gain otherwise (shared by whichever single
+            // channel -- left, right, or the lone SCE channel -- is targeted).
+            let mut gain_idx = 0usize;
+            for target in &cce.targets {
+                let Some(&(first, count)) = tag_channels.get(&target.tag) else { continue };
+                let both = target.is_channel_pair && target.left && target.right && count == 2;
+                if both {
+                    let (gl, gr) = (cce.gains[gain_idx], cce.gains[gain_idx + 1]);
+                    gain_idx += 2;
+                    apply_coupling_gain(gl, &coupling_pcm, &mut self.channels[first].pcm);
+                    apply_coupling_gain(gr, &coupling_pcm, &mut self.channels[first + 1].pcm);
+                } else {
+                    let gain = cce.gains[gain_idx];
+                    gain_idx += 1;
+                    let idx = if target.is_channel_pair && target.right && count == 2 {
+                        first + 1
+                    } else {
+                        first
+                    };
+                    if idx < active_channels {
+                        apply_coupling_gain(gain, &coupling_pcm, &mut self.channels[idx].pcm);
+                    }
+                }
+            }
+        }
     }
 
     /// Consume a `fill_element()`, handing any SBR payload to the replicator that
@@ -762,31 +943,49 @@ impl Decoder {
 
         for i in 0..count {
             let ch = &mut self.channels[i];
-
-            // TNS and the IMDCT both work per window, so rearrange first.
-            if ch.data.ics.window_sequence.is_eight_short() {
-                deinterleave(&ch.data.ics, &ch.data.spec, &mut self.deinterleave_scratch);
-                std::mem::swap(&mut ch.data.spec, &mut self.deinterleave_scratch);
-            }
-
-            apply_tns(&mut ch.data, rate);
-
-            trace_frame(self.frame_count, i, &ch.data);
-
-            let sequence = ch.data.ics.window_sequence;
-            let shape = ch.data.ics.window_shape;
-            let prev_shape = ch.prev_shape;
-
-            self.filterbank.synthesize(
-                &ch.data.spec,
-                sequence,
-                shape,
-                prev_shape,
+            Self::synthesize_channel_data(
+                &mut self.filterbank,
+                &mut self.deinterleave_scratch,
+                rate,
+                &mut ch.data,
                 &mut ch.overlap,
+                &mut ch.prev_shape,
                 &mut ch.pcm,
             );
-            ch.prev_shape = shape;
+            trace_frame(self.frame_count, i, &ch.data);
         }
+    }
+
+    /// The per-channel body of [`Self::synthesize`] (deinterleave, TNS, IMDCT +
+    /// windowing + overlap-add), factored out so a
+    /// [`CouplingChannelElement`]'s own spectrum -- which is not one of
+    /// `self.channels`, but still needs the exact same filterbank chain and its
+    /// own persistent overlap-add state -- can run through it too. `filterbank`
+    /// and `scratch` are taken by reference rather than `&mut self` so this can
+    /// be called once per coupling channel after `self.channels` has already
+    /// been borrowed for the mix targets.
+    fn synthesize_channel_data(
+        filterbank: &mut Filterbank,
+        scratch: &mut Vec<f32>,
+        rate: SamplingRate,
+        data: &mut ChannelData,
+        overlap: &mut Vec<f32>,
+        prev_shape: &mut WindowShape,
+        out: &mut Vec<f32>,
+    ) {
+        if data.ics.window_sequence.is_eight_short() {
+            deinterleave(&data.ics, &data.spec, scratch);
+            std::mem::swap(&mut data.spec, scratch);
+        }
+
+        apply_tns(data, rate);
+
+        let sequence = data.ics.window_sequence;
+        let shape = data.ics.window_shape;
+        let prev = *prev_shape;
+
+        filterbank.synthesize(&data.spec, sequence, shape, prev, overlap, out);
+        *prev_shape = shape;
     }
 }
 
@@ -918,6 +1117,11 @@ pub struct CouplingTarget {
 /// [`crate::error::Error::Unimplemented`].
 #[derive(Debug)]
 pub struct CouplingChannelElement {
+    /// This coupling channel's own `element_instance_tag` -- distinct from
+    /// each target's `tag`, which names the SCE/CPE it mixes into. Used to key
+    /// this element's persistent overlap-add state across frames, the same
+    /// way [`ChannelState`] does for ordinary channels.
+    pub tag: u8,
     pub targets: Vec<CouplingTarget>,
     /// One gain per target, in target order; the first is always exactly 1.0
     /// (the reference hardcodes it rather than transmitting it).
@@ -937,7 +1141,7 @@ impl CouplingChannelElement {
         frame_length: FrameLength,
         aot: AudioObjectType,
     ) -> Result<Self> {
-        let _tag = reader.read_u8(4)?;
+        let tag = reader.read_u8(4)?;
         let ind_sw_cce = reader.read_bit()?;
         let num_coupled = reader.read_u8(3)? as usize;
 
@@ -981,7 +1185,29 @@ impl CouplingChannelElement {
             gains.push(step.powi(-norm_value) as f32);
         }
 
-        Ok(Self { targets, gains, data })
+        Ok(Self { tag, targets, gains, data })
+    }
+}
+
+/// The decode-order channel index that belongs at each column of
+/// [`crate::decoder::aac::downmix::downmix_to_stereo`]'s matrix, for one of
+/// the three implicit `channelConfiguration`s [`Decoder::downmix_layout`]
+/// resolves.
+///
+/// The standard's implicit element order (no PCE) is always centre-first,
+/// front-pair, [LFE last for the configurations that have one]: `SCE(C),
+/// CPE(L,R), CPE(Ls,Rs)[, CPE(Lrs,Rrs)][, LFE]`. The downmix matrix's own
+/// column order (documented on [`crate::decoder::aac::downmix::Layout`]) is
+/// front-pair-first with LFE ahead of the rear channels instead, so this is a
+/// fixed permutation, not a guess -- derived once here from both orderings
+/// rather than re-derived at every call site.
+fn downmix_decode_order(layout: crate::decoder::aac::downmix::Layout) -> &'static [usize] {
+    use crate::decoder::aac::downmix::Layout;
+    match layout {
+        Layout::Ch5_0 => &[1, 2, 0, 3, 4],
+        Layout::Ch5_1 => &[1, 2, 0, 5, 3, 4],
+        Layout::Ch7_0 => &[1, 2, 0, 3, 4, 5, 6],
+        Layout::Ch7_1 => &[1, 2, 0, 7, 3, 4, 5, 6],
     }
 }
 
@@ -1390,6 +1616,153 @@ mod tests {
         assert_eq!(cce.gains[0], 1.0, "the first gain is always the implicit unity");
         assert!((cce.gains[1] - 1.0).abs() < 1e-4, "an all-zero delta must decode to unity gain: {:?}", cce.gains);
         assert!(cce.data.global_gain > 0 || cce.data.global_gain == 0, "ics_data actually parsed");
+    }
+
+    /// `Decoder::write_output_pcm` (phase 7.6) must, once enabled, resolve a
+    /// 5.1 stream's implicit centre-first decode order into the downmix
+    /// matrix's front-pair-first column order before mixing -- not the raw
+    /// decode order -- and must leave a channel count the matrix does not
+    /// cover (stereo) untouched even with downmixing turned on.
+    #[test]
+    fn write_output_pcm_permutes_decode_order_before_downmixing() {
+        let mut dec = Decoder::new(AudioSpecificConfig {
+            audio_object_type: AudioObjectType::AacLc,
+            sampling_rate: SamplingRate::Hz44100,
+            channel_config: ChannelConfiguration::FivePointOne,
+            frame_length: crate::types::FrameLength::Samples1024,
+            depends_on_core_coder: false,
+            core_coder_delay: 0,
+            extension_audio_object_type: None,
+            extension_sampling_rate: None,
+            sbr_present: false,
+            ps_present: false,
+        });
+        dec.active_channels = 6;
+        dec.enable_downmix_to_stereo();
+        assert!(dec.downmix_to_stereo_enabled());
+
+        // Decode order for FivePointOne is C, L, R, Ls, Rs, LFE -- put a
+        // distinct constant in each channel so a wrong permutation shows up
+        // as a completely different (but still plausible-looking) mix.
+        let full_scale = [0.2f32, 0.4, 0.6, 0.05, 0.05, 0.9]; // C, L, R, Ls, Rs, LFE
+        for (ch, &v) in dec.channels.iter_mut().zip(full_scale.iter()) {
+            ch.pcm.iter_mut().for_each(|s| *s = v);
+        }
+
+        dec.write_output_pcm();
+
+        assert_eq!(dec.output_pcm.channels(), 2, "6 implicit channels must collapse to stereo");
+        let (left, right) = crate::decoder::aac::downmix::downmix_to_stereo(
+            crate::decoder::aac::downmix::Layout::Ch5_1,
+            // L, R, C, LFE, Ls, Rs -- the matrix's own order, built directly
+            // from the *named* constants above rather than by re-deriving
+            // the permutation, so this checks the same thing two independent
+            // ways.
+            &[
+                &[full_scale[1]; 1024],
+                &[full_scale[2]; 1024],
+                &[full_scale[0]; 1024],
+                &[full_scale[5]; 1024],
+                &[full_scale[3]; 1024],
+                &[full_scale[4]; 1024],
+            ],
+        );
+        assert_eq!(dec.output_pcm.channel(0)[0], clamp_to_i16(left[0]));
+        assert_eq!(dec.output_pcm.channel(1)[0], clamp_to_i16(right[0]));
+
+        // A stereo frame is not one of the four layouts: downmixing must be a
+        // no-op even though it is enabled.
+        let mut stereo = Decoder::new_default();
+        stereo.active_channels = 2;
+        stereo.enable_downmix_to_stereo();
+        stereo.channels[0].pcm.iter_mut().for_each(|s| *s = 0.5);
+        stereo.channels[1].pcm.iter_mut().for_each(|s| *s = -0.5);
+        stereo.write_output_pcm();
+        assert_eq!(stereo.output_pcm.channels(), 2);
+        assert_eq!(stereo.output_pcm.channel(0)[0], clamp_to_i16(0.5));
+        assert_eq!(stereo.output_pcm.channel(1)[0], clamp_to_i16(-0.5));
+    }
+
+    /// `Decoder::mix_coupling_channels` (phase 7.5) must resolve a target by
+    /// its real `element_instance_tag`, scale-and-add the coupling channel's
+    /// *own* filterbank output (not its raw spectrum) into that target's PCM,
+    /// split a two-gain channel-pair target's gains across the right
+    /// channels, and leave an unresolved target's tag entirely alone rather
+    /// than panicking on a missing map entry.
+    #[test]
+    fn mix_coupling_channels_resolves_targets_and_adds_the_synthesized_signal() {
+        let asc = AudioSpecificConfig {
+            audio_object_type: AudioObjectType::AacLc,
+            sampling_rate: SamplingRate::Hz44100,
+            channel_config: ChannelConfiguration::Stereo,
+            frame_length: crate::types::FrameLength::Samples1024,
+            depends_on_core_coder: false,
+            core_coder_delay: 0,
+            extension_audio_object_type: None,
+            extension_sampling_rate: None,
+            sbr_present: false,
+            ps_present: false,
+        };
+        let n = asc.frame_length.samples();
+
+        let make_data = || {
+            let mut data = ChannelData::new(n);
+            data.spec[3] = 500.0;
+            data.spec[17] = -120.0;
+            data
+        };
+
+        // The independent oracle: synthesize the exact same spectrum through
+        // a fresh filterbank with fresh (zeroed) overlap state, exactly the
+        // way `mix_coupling_channels` does internally for a coupling channel
+        // it has never seen before.
+        let mut oracle_fb = Filterbank::new(n);
+        let mut oracle_scratch = vec![0.0f32; n];
+        let mut oracle_overlap = vec![0.0f32; n];
+        let mut oracle_prev = WindowShape::Sine;
+        let mut expected_pcm = vec![0.0f32; n];
+        Decoder::synthesize_channel_data(
+            &mut oracle_fb,
+            &mut oracle_scratch,
+            asc.sampling_rate,
+            &mut make_data(),
+            &mut oracle_overlap,
+            &mut oracle_prev,
+            &mut expected_pcm,
+        );
+        assert!(expected_pcm.iter().any(|&v| v != 0.0), "the oracle itself must be non-silent");
+
+        let mut dec = Decoder::new(asc);
+        for v in dec.channels[0].pcm.iter_mut() {
+            *v = 1.0;
+        }
+        for v in dec.channels[1].pcm.iter_mut() {
+            *v = -1.0;
+        }
+        let untouched_before = dec.channels[2].pcm.clone();
+
+        let cce = CouplingChannelElement {
+            tag: 9,
+            targets: vec![
+                CouplingTarget { is_channel_pair: true, tag: 3, left: true, right: true },
+                // No element declared tag 5 this frame -- must be skipped, not panic.
+                CouplingTarget { is_channel_pair: false, tag: 5, left: true, right: false },
+            ],
+            gains: vec![1.0, 0.5],
+            data: make_data(),
+        };
+        let mut tag_channels = std::collections::HashMap::new();
+        tag_channels.insert(3u8, (0usize, 2usize));
+
+        dec.mix_coupling_channels(vec![cce], &tag_channels, 2);
+
+        for i in 0..n {
+            let want_l = 1.0 + 1.0 * expected_pcm[i];
+            let want_r = -1.0 + 0.5 * expected_pcm[i];
+            assert!((dec.channels[0].pcm[i] - want_l).abs() < 1e-4, "L[{i}]: {} vs {want_l}", dec.channels[0].pcm[i]);
+            assert!((dec.channels[1].pcm[i] - want_r).abs() < 1e-4, "R[{i}]: {} vs {want_r}", dec.channels[1].pcm[i]);
+        }
+        assert_eq!(dec.channels[2].pcm, untouched_before, "an unresolved target tag must not touch any channel");
     }
 
     /// `ind_sw_cce_flag == 0` must be refused for exactly that reason -- not

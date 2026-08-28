@@ -82,7 +82,7 @@ pub mod prelude {
     pub use crate::bitstream::{BitReader, BitWriter};
     pub use crate::buffer::AudioBuffer;
     pub use crate::decoder::Decoder;
-    pub use crate::encoder::{Encoder, EncoderConfig};
+    pub use crate::encoder::{Encoder, EncoderConfig, OutputFormat};
     pub use crate::error::{Error, Result};
     pub use crate::syntax::{AdtsHeader, AudioSpecificConfig};
     pub use crate::types::{

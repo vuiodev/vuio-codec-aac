@@ -15,7 +15,7 @@ pub mod sbr;
 pub mod usac;
 
 pub use drc::DrcEncoder;
-pub use engine::{Encoder, EncoderConfig};
+pub use engine::{Encoder, EncoderConfig, OutputFormat};
 pub use ps::PsEncoder;
 pub use sbr::SbrEncoder;
 pub use usac::UsacEncoder;

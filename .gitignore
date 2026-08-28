@@ -1,7 +1,6 @@
 c/
 target/
 test_vectors/
-text/
 CLAUDE.md
 vid/
 .DS_Store

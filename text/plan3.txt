@@ -1,0 +1,9 @@
+https://claude.ai/code/artifact/93b07879-8e35-4f4a-8e13-37cde3a9ca18
+
+so the rust codebase is supposed to be 100% implementation of c codebase in c folder, 
+and output bit perfect audio aac. and be fastest possible with like 1000x speed. 
+can you optimize this codebase to the edge, with all simd and other asm whatever optimizations, 
+and check that actually everything that is in c was implemented properly in rust?
+
+/goal port everything that is currently missing in rust codebase but exist in c codebase, use proper rust, objective, not 
+  direct translation, also implement all possible optimizations in code, including rayon, simd, asm and so on, make decisions on you own

@@ -1,0 +1,1502 @@
+================================================================================
+  libxaac (C)  ->  vuiocodecaac (Rust)          FULL MIGRATION PLAN & AUDIT
+================================================================================
+  Written        2026-08-27
+  Contents       0 how to read  |  1 where the port stands  |  2 per-subsystem
+                 audit  |  3 the phased work queue  |  4 optimisation track  |
+                 5 idiomatic-Rust rules  |  6 verification  |  7 risks and
+                 decisions  |  8 summary  |  appendix A: all 283 C files
+  Audited at     git 315e281 "usac: LPC/LSP/LSF conversion and coarse LSF
+                 codebook for LPD"  (+ one untracked file, see 2.4)
+  Reference      c/libxaac        283 .c files, 233,615 lines
+                                  (headers, decoder/{armv7,armv8,x86,x86_64,
+                                   generic}/ and test/ excluded from counts)
+  Target         src/              93 .rs files,  27,327 lines
+  Baseline       cargo test --release --all-features
+                 -> 254 tests, 254 pass, 0 fail, 0 ignored
+                 cargo build --all-features -> clean
+
+================================================================================
+ 0.  HOW TO READ THIS DOCUMENT
+================================================================================
+
+Status legend, used identically in every table and in the per-file appendix:
+
+  [DONE]  The tool is really implemented, is reachable from the public API, and
+          is covered by tests. Not a promise of bit-exactness against libxaac
+          (see 6.2), a promise that the algorithm is there.
+  [PART]  Real code exists and works, but is narrower than the C reference:
+          fewer modes, fewer rates, a subset of the syntax, or a simplification
+          that is documented in the module itself.
+  [SKIP]  The bitstream syntax is parsed exactly far enough to keep the reader
+          aligned, and the tool is then NOT applied. Streams decode; they decode
+          without that tool. This is a correctness gap that hides well.
+  [FAKE]  A Rust module exists under this name, is exported from the crate root,
+          has doc comments describing the real algorithm -- and does not
+          implement it. Strictly worse than [TODO]: the API and the README
+          both claim a capability the code does not have. Three of these exist
+          today and Phase 0 exists to deal with them.
+  [TODO]  Nothing exists.
+  [N/A]   Deliberately not ported. Three sub-cases, always named where used:
+          (a) fixed-point twins of a float file we already ported (libxaac ships
+              both; this crate is float-only by design -- see 6.2),
+          (b) hand-written SIMD/arch selector files, replaced by dsp/simd.rs
+              plus LLVM autovectorisation,
+          (c) C-specific plumbing: allocator/scratch carving, handle creation,
+              the C state machine -- replaced by Rust ownership and types.
+
+On line counts. The C figures say how much reference material exists to work
+from, NOT how much Rust must be written. Every faithful port in this repo so far
+has landed at 25-40% of the C line count, because libxaac ships hand-unrolled
+fixed-point and float variants of nearly every kernel, plus per-architecture
+copies, and this crate ships one float version with a SIMD kernel behind it.
+Budget accordingly: the 96K lines of C still to port is roughly 30K lines of
+Rust, not 96K.
+
+================================================================================
+ 1.  WHERE THE PORT STANDS  (the one-screen answer)
+================================================================================
+
+  Group totals below are exactly the appendix A groups, so the two reconcile.
+  Rust LOC for shared layers (DSP, bitstream, syntax, tables) is counted once, on
+  the decoder row that first needs it; the encoder uses the same code.
+
+    C LOC   Rust LOC  Subsystem                        Status
+  --------------------------------------------------------------------------
+   DECODER
+   22,146      2,486  AAC-LC core                      [DONE] for LC proper
+    8,276      1,402  Framing / config / API           [PART] ADTS + raw wired
+    9,720      3,806  DSP / transforms / filterbanks   [DONE] float path + peak limiter
+   20,932      3,427  SBR + eSBR                       [DONE] v1+CRC / [TODO] eSBR
+    2,964      1,651  Parametric Stereo                [DONE]
+   10,215      2,759  USAC                             [PART] FD + ACELP + AVQ(qn<=4) done
+   17,868      1,953  uniDRC                           [PART] legacy + loudness/chLayout/downmix/gainMods/gainSet
+   35,291         99  MPEG Surround                    [TODO] refuses rather than fakes
+        -      1,697  (decoder engine + batch)
+   ENCODER
+   17,356      2,746  AAC core                         [PART] no PNS/IS/pulse
+    6,099          -  Framing / config / API           [PART] ADTS out, no ADIF
+    3,973          -  DSP                              (shares decoder DSP)
+   20,032         78  SBR + eSBR                       [TODO] refuses rather than fakes
+    1,628         84  Parametric Stereo                [TODO] refuses rather than fakes
+   31,254      1,887  USAC                             [PART] FD only
+    8,355        545  uniDRC                           [PART] BS.1770 only
+   10,409          0  MPEG Surround                    [TODO]
+        -      1,106  (encoder engine)
+   SHARED
+    7,097          -  common/ (eSBR ROM + FFT)         [TODO] eSBR half
+        -      4,057  tables/
+        -      1,331  bin/ (CLI tools)
+        -        847  types, error, buffer, lib
+  --------------------------------------------------------------------------
+  233,615     31,998  TOTAL
+
+  Reclassifications applied above and in appendix A, against a naive filename
+  bucketing, because five filenames mislead:
+    ixheaacd_spectrum_dec.c  (466)  is the USAC FD channel stream, not AAC core.
+    ixheaacd_process.c       (606)  is usac_process + eSBR parse, not AAC core.
+    ixheaacd_pred_vec_block.c(239)  is eSBR PVC, not main-profile prediction.
+    ixheaacd_lpc.c           (828)  is the USAC LPD top level, not generic LPC.
+    ixheaace_nf.c            (178)  is USAC noise filling, not an AAC tool.
+  ixheaacd_peak_limiter.c (333) is counted in the decoder AAC-core row; it is a
+  cross-cutting output stage and is tracked in 2.15, not 2.1.
+
+  By status, over all 283 C files (full tally at the end of appendix A):
+    [DONE]  80 files    54,951 C lines      [FAKE]   1 files     1,076 C lines
+    [PART]  33 files    53,030 C lines      [TODO] 156 files   117,702 C lines
+    [SKIP]   1 file        531 C lines      [N/A]   12 files     6,325 C lines
+  (retallied after the 2026-08-27 session below; see appendix A for the
+  authoritative per-file numbers, which this line is generated from)
+
+Read in one sentence: the AAC-LC / HE-AAC v1 / HE-AAC v2 DECODE path is real and
+tested; USAC's ACELP speech core just joined it; everything else is somewhere
+between a partial and a placeholder.
+
+UPDATE 2026-08-27 (same day, second session): the five placeholders below were
+the most urgent item in this document -- each was reachable from the public API
+and documented as if it worked. All five are now closed out, four by making the
+dishonesty impossible rather than by finishing the algorithm:
+    1. decoder::mps::MpsDecoder        [FIXED] now Err(Unimplemented); phase 9 still open
+    2. encoder::sbr::SbrEncoder        [FIXED] now Err(Unimplemented); phase 4 still open
+    3. encoder::ps::PsEncoder          [FIXED] now Err(Unimplemented); phase 4.6 still open
+    4. decoder::usac::UsacDecoder      [DONE]  real ACELP end to end (phase 1.1-1.6, 1.9);
+                                                TCX (1.7) is the one piece left, and
+                                                decode_lpd_frame refuses it explicitly
+    5. encoder::usac::classify_frame   still a heuristic stand-in -- phase 3.1, open
+Only #5 remains an active placeholder; it has a real caller and cannot simply
+error without breaking the encoder, unlike 1-3 which had none.
+
+UPDATE 2026-08-28 (third session): this session's ordering rule 2 ("finish what
+is half-built before starting anything new") was applied literally: rather than
+open a new subsystem, it closed out three items this document had already
+identified as real-but-unwired or missing outright.
+    1. Phase 7.5 (CCE mixing)   [DONE] decoder::engine::mix_coupling_channels
+       resolves each coupling target's tag through a per-frame tag->channel
+       map and actually scales-and-adds the coupling channel's own
+       filterbank output into its targets' PCM, with persistent per-CCE
+       overlap-add state keyed by the CCE's own tag.
+    2. Phase 7.6 (downmix wiring) [DONE] Decoder::enable_downmix_to_stereo,
+       narrower than the reference on purpose: only the three implicit
+       (PCE-less) channelConfigurations, permuted from the standard's
+       centre-first decode order into the matrix's own column order.
+    3. Phase 2.9 (ADIF writing) [DONE] encoder::engine::OutputFormat::Adif,
+       bit-continuous header-to-first-frame join, round-tripped through the
+       real Decoder end to end, exposed via `aacenc --adif`.
+Three deep-dives were investigated and deliberately NOT started this session,
+each for a specific, real reason rather than running out of time quietly:
+    - Phase 1.7 (TCX). Confirmed the true LPD superframe structure
+      (LEN_SUPERFRAME=1024 / LEN_FRAME=256 / NUM_FRAMES=4 -- the existing
+      decode_lpd_frame decodes one 256-sample core-frame, not a whole
+      superframe, which phase 1.8's mode-mixing work will need). Did not
+      implement the transform itself: this document's own phase 1.6
+      investigation already established there is no bit-exact reference
+      vector to check libxaac's specific fixed-point FFT convention against,
+      and that risk is unchanged. The recommended path (this crate's own
+      verified MdctContext/ImdctContext at the three TCX lengths, which are
+      all powers of two -- 256/512/1024 -- unlike the asymmetric l/m/r
+      transition windows) is still the right one for whoever picks this up.
+    - Phase 2.1/2.2 (USAC ISO framing). Read UsacConfig()/UsacFrame()'s real
+      bit layout in full (ixheaacd_init_config.c) -- escape-coded sampling
+      frequency and element count, per-element tw_mdct/noise_filling/
+      stereo_config_index, sbr_ratio_index gating. Framing turned out not to
+      be the whole gap: decoder::usac::fd::read_channel_header
+      unconditionally reads noise_level/noise_offset regardless of the
+      per-element noise_filling config bit (documented in that module as a
+      deliberate minimal-path simplification), which a real encoder's stream
+      would violate. Real interop needs that fixed too, not just a framing
+      layer on top of the existing FD decoder -- a materially bigger change
+      than phase 2's original estimate implied, so it was not started rather
+      than shipped partially working.
+    - Phase 6.2 (DRC dynamic payload). Read impd_drc_dec.c: applying a
+      decoded gain sequence depends on num_drc_ch_groups/channel_group_of_ch/
+      gain_set_index, which come from the selection process (phase 6.4,
+      impd_drc_selection_process*.c, 3,215 lines), not from static or dynamic
+      payload parsing alone. Building the dynamic payload parser in isolation
+      would have added a sixth disconnected brick next to the five phase 6.1
+      already has, not a connected pipeline -- the same anti-pattern this
+      session's actual work (7.5/7.6) was fixing elsewhere.
+
+================================================================================
+ 2.  AUDIT -- SUBSYSTEM BY SUBSYSTEM
+================================================================================
+
+--------------------------------------------------------------------------------
+ 2.1  AAC-LC DECODE CORE                          C 22,146  ->  Rust 2,223+1,176
+--------------------------------------------------------------------------------
+Rust: src/decoder/aac/{ics,huffman,dequant,tns,stereo,pns,channel}.rs
+      src/decoder/engine.rs, src/decoder/batch.rs
+
+  [DONE] Spectral Huffman decode, all 11 codebooks + ESC, via the reference's own
+         length-class search; tables script-extracted from ixheaacd_aac_rom.c by
+         tools/extract_rom.py, so they are correct by construction.
+         C: block.c, longblock.c, hufftables.c, huff_tools.c, aac_rom.c
+  [DONE] Section data, scalefactor data, all four window sequences, both window
+         shapes, grouping, short-block interleave/deinterleave.
+  [DONE] Inverse quantisation (x^(4/3) via tabulated power law), scalefactor
+         application.                                    C: block.c, rom.c
+  [DONE] TNS: PARCOR->LPC, AR/MA lattice both directions. C: tns.c, aac_tns.c
+  [DONE] M/S stereo and intensity stereo.                 C: stereo.c
+  [DONE] PNS with the reference's stream-threaded RNG, plus a position-
+         independent mode so the parallel decoder is byte-identical.
+                                                          C: pns_js_thumb.c
+  [DONE] Pulse data.                                      C: block.c
+  [DONE] DSE / fill element traversal, element ordering, PCE.
+                                                          C: common_lpfuncs.c
+  [SKIP] LTP (long-term prediction). ics.rs::skip_ltp_data consumes ltp_data()
+         to keep alignment; the predictor is never run. AOT 4 / ER-LTP streams
+         decode with an audible defect rather than failing.  C: lt_predict.c 531
+  [DONE] Coupling channel elements, real end to end including the target mix
+         (decoder::engine::CouplingChannelElement + mix_coupling_channels).
+         Still only the ind_sw_cce_flag==1 case, matching libxaac's own
+         supported scope. See phase 7.5.               C: multichannel.c 422
+  [TODO] HCR (Huffman codeword reordering, error-resilient).  C: huff_code_reorder.c 1,906
+  [TODO] RVLC (reversible VLC, error-resilient).              C: rev_vlc.c 1,755
+  [TODO] Error concealment (frame interpolation/mute-ramp).   C: aac_ec.c + ec_rom.c 489
+  [DONE] Multichannel downmix-to-stereo. decoder::aac::downmix ports the fixed
+         matrix for all four layouts, wired as an opt-in output stage for the
+         three implicit (PCE-less) channel configurations; an explicit PCE's
+         own channel roles still aren't tracked. See phase 7.6.
+                                                              C: multichannel.c
+  [TODO] LD / ELD core (512/480 frame, low-delay window, ELD SBR).
+  [N/A]  Fixed-point spectral paths; basic_ops.c is ported as dsp/math.rs and
+         kept because SBR/PS still use the fixed-point-derived constants.
+
+--------------------------------------------------------------------------------
+ 2.2  DECODER FRAMING, CONFIG, PUBLIC API              C 8,276  ->  Rust ~2,057
+--------------------------------------------------------------------------------
+Rust: src/syntax/{adts,adif,asc,latm,pce,raw}.rs, src/bitstream/*, engine.rs
+
+  [DONE] ADTS parse + CRC-16.            C: headerdecode.c, adts_crc_check.c
+  [DONE] AudioSpecificConfig incl. the SBR/PS explicit-hierarchical extension.
+                                          C: init_config.c (AAC subset)
+  [DONE] PCE.                             C: headerdecode.c
+  [DONE] Bit reader/writer.               C: bitbuffer.c
+  [DONE] LATM/LOAS: syntax/latm.rs parses StreamMuxConfig and AudioMuxElement;
+         Decoder::decode_frame auto-detects a LOAS sync and unwraps it -- see
+         phase 0.5 (this line was stale after that phase landed).
+                                          C: latmdemux.c 320
+  [DONE] ADIF: syntax/adif.rs, wired the same way in phase 0.5.
+  [PART] Public API. The C ixheaacd_api.c (3,788 lines) is a get/set-config
+         state machine with explicit scratch carving. Deliberately NOT ported
+         shape-for-shape; replaced by Decoder::new/decode_frame + typed config.
+         What is genuinely missing from the Rust API is capability, not shape:
+         no USAC config, no MPS config, no DRC selection parameters.
+  [TODO] Wire LATM + ADIF into Decoder (est. 1 day, pure plumbing, high value:
+         two working parsers are dark today).
+
+--------------------------------------------------------------------------------
+ 2.3  DSP / TRANSFORMS / FILTERBANKS                  C 10,930  ->  Rust 3,478
+--------------------------------------------------------------------------------
+Rust: src/dsp/{fft,imdct,mdct,qmf,filterbank,window,lpc,math,resampler,simd}.rs
+
+  [DONE] Mixed-radix complex FFT, radix-4 core, per-length twiddle arrays laid
+         out contiguously so a vector load never gathers.     C: fft.c
+  [DONE] IMDCT as a quarter-length complex FFT (this replaced an O(N^2) matrix
+         product and an 8 MB cosine table -- the single biggest win in the repo).
+                                                              C: aac_imdct.c, imdct.c
+  [DONE] Forward MDCT.                                        C: fd_mdct.c, iusace_fft.c
+  [DONE] 32-band analysis / 64-band synthesis QMF on the real ISO prototype,
+         FFT-modulated.                                       C: qmf_dec.c
+  [DONE] Windowing, overlap-add, all sequences.               C: Windowing.c, lpfuncs.c
+  [DONE] Levinson-Durbin, LPC analysis/synthesis filters.
+  [DONE] NEON + AVX/FMA radix-4 butterfly and complex-multiply kernels behind a
+         runtime feature check, each checked against its scalar twin in tests.
+  [TODO] 480/512-point MDCT for LD/ELD and the 960-sample frame length.
+                                                              C: mdct_480.c 489
+  [TODO] eSBR's own FFT/DFT sizes (used by the harmonic transposer).
+                                                              C: common/ixheaac_esbr_fft.c 1,209
+  [N/A]  fft_ifft_32x32.c, dsp_fft32x32s.c, radix2_fft.c: fixed-point twins.
+  [N/A]  decoder/{armv7,armv8,x86,x86_64,generic}/: hand-written asm selectors,
+         replaced by dsp/simd.rs + -C target-cpu=native.
+
+--------------------------------------------------------------------------------
+ 2.4  SBR / eSBR DECODE                              C 20,932  ->  Rust 3,175
+--------------------------------------------------------------------------------
+Rust: src/decoder/sbr/{mod,header,grid,data,hf}.rs, src/tables/sbr.rs
+
+  [DONE] SBR header, master/derived frequency band tables, patch construction.
+                                                     C: freq_sca.c, sbrdec_initfuncs.c
+  [DONE] Frame grid, all four frame classes (FIXFIX/FIXVAR/VARFIX/VARVAR).
+                                                     C: env_extr.c
+  [DONE] Envelope + noise-floor Huffman decode, both amplitude resolutions,
+         delta-time and delta-freq, coupled (bs_coupling) and dual-channel.
+                                                     C: env_extr.c, env_dec.c
+  [DONE] LPP transposer: per-subband 2nd-order predictor, chirp factors,
+         inverse filtering.                          C: lpp_tran.c
+  [DONE] Envelope adjustment, gain limiting, noise addition, added sinusoids.
+                                                     C: env_calc.c
+  [DONE] Wired end-to-end: HE-AAC decodes at its full nominal rate.
+  [TODO] eSBR harmonic transposer (HBE), time-domain and DFT variants. This is
+         the single largest missing decode tool for xHE-AAC.
+                                        C: hbe_trans.c 1,606 + hbe_dft_trans.c 941
+  [TODO] PVC (predictive vector coding) for the 4:1 QMF case.
+                                        C: pred_vec_block.c 239 + pvc_rom.c 616
+  [TODO] eSBR envelope calculation variants and eSBR polyphase.
+                                        C: esbr_envcal.c 1,093 + esbr_polyphase.c 338
+  [TODO] SBR CRC check.                 C: sbr_crc.c 97
+  [PART] tables/sbr.rs carries the tables SBR v1 needs; sbr_rom.c has more.
+
+--------------------------------------------------------------------------------
+ 2.5  PARAMETRIC STEREO DECODE                        C 2,964  ->  Rust 1,651
+--------------------------------------------------------------------------------
+Rust: src/decoder/ps/{mod,data,hybrid}.rs, src/tables/ps.rs
+
+  [DONE] PS payload parse: IID/ICC/IPD/OPD, both resolutions, delta coding.
+                                                     C: ps_bitdec.c
+  [DONE] Hybrid analysis/synthesis filterbank (10/20/34 band).   C: hybrid.c
+  [DONE] Decorrelator with its all-pass chain and transient detector.
+  [DONE] Stereo reconstruction mixing.                            C: ps_dec_flt.c
+  [TODO] Low-power ("thumb") PS variant.            C: thumb_ps_dec.c 181 (optional)
+  [N/A]  ps_dec.c -- the fixed-point twin of ps_dec_flt.c.
+
+--------------------------------------------------------------------------------
+ 2.6  MPEG SURROUND DECODE                           C 35,291  ->  Rust 92  [TODO]
+--------------------------------------------------------------------------------
+Rust: src/decoder/mps/mod.rs
+
+  This is the largest single subsystem in libxaac. As of 2026-08-27 the module
+  no longer fabricates an answer: MpsDecoder::decode() reads no bitstream, uses
+  no transmitted CLD/ICC/CPC, has no QMF/hybrid stage, no decorrelator, no
+  M1/M2 matrices -- and says so, returning Err(Error::Unimplemented) rather
+  than the fixed matrix upmix (c = 0.5*(l+r), s_l = l - 0.5*c, lfe = 0.25*(l+r))
+  it used to return silently. tree_config is still stored and never read; there
+  is nothing to read it for yet. MpsDecoder and MpsSpatialCues stay re-exported
+  from crate::decoder -- the types are the right shape for the real decoder to
+  grow into, only the body was fake.
+
+  Everything below is [TODO]:
+    bitstream + config      mps_parse.c 1,501, mps_bitdec.c 2,828, ld_mps_config.c 338
+    core decode loop        mps_dec.c 2,139, mps_process.c 380, ld_mps_dec.c 212
+    M1/M2 matrix synthesis  mps_calc_m1m2_{common,emm,tree_515x,tree_51sx,
+                            tree_52xx,tree_727x,tree_757x}.c + m1m2_common.c
+                            + apply_m1.c + apply_m2.c + apply_common.c  ~4,505
+    filterbanks             mps_polyphase.c 1,180, mps_poly_filt.c 391,
+                            mps_hybrid_filt.c 1,232, mps_mdct_2_qmf.c 1,888
+    decorrelation           mps_decorr.c 1,070
+    temporal shaping        mps_temp_process.c 1,474, mps_temp_reshape.c 211,
+                            mps_reshape_bb_env.c 594, mps_smoothing.c 726,
+                            mps_tonality.c 436, mps_blind.c 433
+    residual coding         mps_res_*.c (block, channel, channel_info,
+                            longblock, pns_js_thumb, pulsedata, tns)  ~2,021
+    ROM                     mps_rom.c 8,286
+    init                    mps_initfuncs.c 1,416, mps_get_index.c 61
+
+--------------------------------------------------------------------------------
+ 2.7  USAC / xHE-AAC DECODE                          C 10,215  ->  Rust 1,590
+--------------------------------------------------------------------------------
+Rust: src/decoder/usac/{arith,acelp,tcx,avq,fd,lsf,container,mod}.rs, src/tables/usac_*.rs
+
+  [DONE] Context-adaptive arithmetic decoder for spectral data, with the real
+         cumulative-frequency tables and context derivation.   C: arith_dec.c
+  [DONE] FD (frequency domain) path: spectrum, noise filling, TNS, M/S, rate
+         handling -- against this crate's own container, not ISO framing.
+  [DONE] LSF <-> LSP <-> LPC conversion both directions.       C: lpc_dec.c
+  [PART] Coarse 8-bit LSF codebook (DICO_LSF_ABS_8B) ported; the second-stage
+         AVQ refinement is not wired in (next line).
+  [PART] RE8/Gosset lattice AVQ decode, in the new src/decoder/usac/avq.rs
+         (this session): rotated_gosset_mtx_dec for qn<=4 (the base lattice,
+         no Voronoi extension needed) -- get_abs_leader_tbl's cumulative-
+         boundary search, rank_of_permutation's factorial-number-system
+         un-ranking, and the sign-pattern unpacking, all ported from
+         ixheaacd_avq_dec.c. 6 tests, including one that decodes every valid
+         code across every one of the 37 leader classes and checks the result
+         is a genuine signed permutation of that class's real
+         ABSOLUTE_LEADER_TAB row -- a real structural correctness proof, not
+         a few spot checks. This module's docstring previously described
+         these exact functions as if they existed (find_nearest_neighbor,
+         gosset_compute_rank_and_sign, etc.) when the file held only tables --
+         that docstring is now corrected to point here. Still open: the
+         qn>4 Voronoi extension (ixheaacd_voronoi_idx_dec, needed for larger
+         residuals) and both real callers (FAC coefficient decode -- phase
+         1.7 -- and wiring this into the LSF second-stage refinement itself).
+                                                     C: avq_rom.c 1,227, avq_dec.c 312
+  [DONE] ACELP speech core, real end to end, in src/decoder/usac/acelp.rs
+         (Phase 1.1-1.6, 1.9, this session): subframe bitstream parse, the
+         1/2/3/4-pulses-per-track algebraic codebook, fractional-pitch
+         adaptive codebook via the 4x-oversampled interpolation filter,
+         energy-predicted gain VQ, pitch sharpening, voicing-weighted gain
+         smoothing, LPC synthesis and frame de-emphasis. LSF-domain
+         interpolation of the per-subframe LPC filter and the lpd_mode ladder
+         dispatch live in decoder/usac/mod.rs. 11+7 new tests, including a
+         residual-inverts-synthesis property test and an end-to-end
+         bitstream-to-PCM test.
+                       C: acelp_bitparse.c 594, acelp_decode.c 685, acelp_tools.c 203
+  [TODO] TCX (the transform half of LPD) and forward alias cancellation, which
+         bridges an ACELP/TCX/FD mode switch. decode_lpd_frame() detects a
+         non-ACELP lpd_mode and returns Err(Unimplemented) rather than
+         guessing; an all-ACELP superframe already decodes correctly without
+         either.
+           acelp_mdct.c       243   ACELP-side MDCT for FAC
+           tcx_fwd_alcnx.c    453   TCX + forward alias cancellation
+           tcx_fwd_mdct.c     255   TCX MDCT
+           fwd_alias_cnx.c    199   FAC across mode switches
+  [PART] lpc.c 828 (LPD superframe top level): mode-ladder dispatch and LSF
+         interpolation ported; FAC-at-mode-boundary and the bass post-filter
+         (FIR_LP_FILT is extracted, unused) are not.
+  [TODO] Complex prediction stereo (USAC's real stereo tool; Rust FD does M/S
+         only).                                       C: ext_ch_ele.c 1,069
+  [TODO] USAC error concealment.                      C: usac_ec.c 642
+  [TODO] ISO/IEC 23003-3 UsacConfig() / UsacFrame() syntax. Today the FD codec
+         round-trips through a private "VUSC" container (src/encoder/usac/
+         container.rs) precisely because ADTS cannot express AOT 42. Nothing
+         produced by another encoder can be decoded, and nothing this encoder
+         produces can be decoded by anything else. This is the interop blocker.
+                                                      C: spectrum_dec.c 466, process.c 606
+
+--------------------------------------------------------------------------------
+ 2.8  uniDRC DECODE                                  C 17,868  ->  Rust 478
+--------------------------------------------------------------------------------
+Rust: src/decoder/drc/mod.rs
+
+  [DONE] The legacy MPEG-4 dynamic_range_info() fill-element: parse, per-band
+         exponents, application to spectrum and to samples, target-level
+         normalisation.                          C: ixheaacd_drc_freq_dec.c (subset)
+  [TODO] The whole of MPEG-D Part 4 uniDRC in decoder/drc_src/ (16,761 lines):
+         static payload (2,501), dynamic payload (1,458), gain decoder
+         (790+450), DRC set selection process (1,559+1,119+537), loudness
+         control (906), parametric DRC (1,109), EQ (1,347), filter bank (431),
+         shape filter (308), multiband (166), peak limiter (181), ROM (1,144).
+         This is what xHE-AAC streams actually carry.
+
+--------------------------------------------------------------------------------
+ 2.9  AAC ENCODE CORE                                C 17,356  ->  Rust 3,852
+--------------------------------------------------------------------------------
+Rust: src/encoder/aac/{psycho,rate,quant,huffman,tns,block_switch,bitstream}.rs
+      src/encoder/engine.rs
+
+  [DONE] Psychoacoustic model: spreading function, tonality, masking thresholds,
+         perceptual entropy.                     C: psy_mod.c, psy_configuration.c,
+                                                    psy_utils*.c, adjust_threshold.c
+  [DONE] Per-band rate loop with warm-started scalefactor search.
+                                                 C: sf_estimation.c, fd_qc_adjthr.c
+  [DONE] Quantisation, codebook selection, section formation, bit counting.
+                                                 C: fd_quant.c, quant.c, bits_count.c,
+                                                    dynamic_bits.c, static_bits.c
+  [DONE] Block switching with transient lookahead; short-window grouping.
+                                                 C: block_switch.c, group_data.c
+  [DONE] TNS.                                    C: tns.c, tns_init.c, tns_params.c
+  [DONE] M/S stereo decision.                    C: ms_stereo.c, calc_ms_band_energy.c
+  [DONE] ADTS writing, SCE/CPE/LFE, multichannel element layout.
+                                                 C: write_bitstream.c, write_adts_adif.c
+  [DONE] Rayon across channels in the rate loop.
+  [TODO] Stereo pre-processing.                  C: stereo_preproc.c 256
+  [TODO] Complex prediction encode.              C: cplx_pred.c 523
+  [DONE] ADIF writing. encoder::engine::OutputFormat::Adif (new, 2026-08-28):
+         one AdifHeader before the first frame, joined to it bit for bit
+         (the header's length is not byte-aligned in general -- byte-aligning
+         it first and concatenating bytes, the obvious-looking approach,
+         would silently corrupt every real stream), bare raw_data_block()s
+         after. One end-to-end test encodes four real frames, decodes every
+         chunk back through Decoder::decode_frame (a cold decoder, seeded
+         with the wrong rate/channel count on purpose, must reconfigure
+         itself from the header the way phase 0.5 already made it able to).
+         `aacenc --adif` exposes it from the CLI.
+                                                 C: write_adts_adif.c (ADIF half)
+  [TODO] LD/ELD encode.
+  Not gaps: PNS, intensity stereo and pulse coding are absent here, and are also
+  absent from the C encoder. Do not "port" them; there is nothing to port.
+
+--------------------------------------------------------------------------------
+ 2.10  SBR ENCODE                                 C 20,032  ->  Rust 71  [TODO]
+--------------------------------------------------------------------------------
+Rust: src/encoder/sbr/mod.rs
+
+  As of 2026-08-27, encode_sbr_frame no longer runs a QMF analysis just to throw
+  it away and return five hard-coded bytes: it returns Err(Unimplemented). It
+  was never called by src/encoder/engine.rs, which is why the encoder still
+  produced valid streams even while this returned nonsense.
+
+  Everything is [TODO]: env_est.c 2,948, write_bitstream.c 1,399, qmf_enc.c 1,356,
+  frame_info_gen.c 1,151, main.c 1,097, missing_harmonics_det.c 747,
+  freq_scaling.c 692, tran_det.c 279 (+hp 333), ton_corr.c 329 (+hp 190),
+  noise_floor_est.c 323, inv_filtering_estimation.c 248, code_envelope.c 192
+  (+lp 243), env_est_init.c 169, crc.c 126, qmf_enc_init.c 87, misc.c 78,
+  rom.c 1,939; plus eSBR encode: hbe_trans.c 1,589, hbe_dft_trans.c 1,007,
+  hbe_fft_ifft_32x32.c 1,679, hbe_polyphase.c 329, iusace_esbr_inter_tes.c 793,
+  iusace_esbr_pvc.c 426 (+rom 251), iusace_esbr_rom.c 32.
+
+--------------------------------------------------------------------------------
+ 2.11  PS ENCODE                                   C 1,628  ->  Rust 84  [TODO]
+--------------------------------------------------------------------------------
+Rust: src/encoder/ps/mod.rs
+
+  As of 2026-08-27, encode_stereo no longer computes one broadband IID/ICC pair
+  from time-domain energies and calls it PS: it returns Err(Unimplemented). Real
+  PS parameters are per hybrid subband per parameter set, extracted in the
+  hybrid QMF domain, and quantised against the standard's IID/ICC tables --
+  still none of that exists. Never called by the encoder engine.
+
+  [TODO]: ps_enc.c 671, ps_bitenc.c 312, ps_enc_init.c 210, hybrid.c 370,
+          hybrid_init.c 65.
+
+--------------------------------------------------------------------------------
+ 2.12  MPS ENCODE                                  C 10,409  ->  Rust 0  [TODO]
+--------------------------------------------------------------------------------
+  Nothing exists, and nothing claims to. Files: mps_nlc_enc.c 1,914,
+  mps_enc.c 1,391, mps_huff_tab.c 1,385, mps_bitstream.c 1,031,
+  mps_polyphase.c 1,023, mps_hybrid_filter.c 1,000, mps_tools_rom.c 496,
+  mps_param_extract.c 344, mps_frame_windowing.c 301, mps_rom.c 254,
+  mps_dmx_tdom_enh.c 215, mps_dct.c 211, mps_tree.c 188, mps_qmf.c 164,
+  mps_onset_detect.c 148, mps_delay.c 129, mps_vector_functions.c 80,
+  mps_static_gain.c 74, mps_filter.c 61.
+
+--------------------------------------------------------------------------------
+ 2.13  USAC ENCODE                                C 31,254  ->  Rust 1,887
+--------------------------------------------------------------------------------
+Rust: src/encoder/usac/{fd,arith,tns,lsf,container,mod}.rs
+
+  [DONE] Arithmetic encoder matching the decoder.       C: arith_enc.c
+  [DONE] FD path: MDCT, per-band rate loop, M/S, noise filling, TNS.
+                                     C: enc_main.c (FD half), tns_usac.c, ms.c, nf.c
+  [DONE] LPC analysis + LSF quantisation stage 1.       C: lpc.c
+  [PART] Windowing/block switching for USAC.  C: windowing.c, block_switch.c
+  [PART] Psychoacoustics for USAC.            C: psy_mod.c, psy_utils.c, psy_rom.c
+  [PART] iusace_rom.c is 15,083 lines; the arithmetic-coder tables and the LSF
+         codebook are ported, the rest is not.
+  [FAKE] Core mode decision. encoder/usac/mod.rs::classify_frame is a crude
+         time-domain heuristic standing in for the real signal classifier.
+                            C: signal_classifier.c 1,076 + _rom.c 1,518
+  [TODO] LPD encode -- the analysis-by-synthesis half of 2.7:
+           lpd_enc.c 850, lpd_utils.c 593, lpd_rom.c 417,
+           acelp_enc.c 439, acelp_tools.c 1,082, acelp_rom.c 213,
+           tcx_enc.c 844, tcx_mdct.c 186,
+           enc_fac.c 537, fd_fac.c 332  (FAC on every mode switch)
+  [TODO] AVQ encode (lattice search + index coding).   C: avq_enc.c 343, lpc_avq.c 372
+  [TODO] ISO USAC bitstream writer.                    C: write_bitstream.c 712
+
+--------------------------------------------------------------------------------
+ 2.14  uniDRC ENCODE                               C 8,355  ->  Rust 545
+--------------------------------------------------------------------------------
+Rust: src/encoder/drc/mod.rs
+
+  [DONE] BS.1770 K-weighting + gated integrated loudness, and emission of the
+         legacy dynamic_range_info() element.   C: ixheaace_loudness_measurement.c
+  [TODO] encoder/drc_src/: mux.c 3,374, uni_drc_eq.c 1,439, gain_enc.c 1,024,
+         api.c 844, gain_calculator.c 537, enc.c 339, tables.c 214,
+         uni_drc_filter_bank.c 184.
+
+--------------------------------------------------------------------------------
+ 2.15  CROSS-CUTTING GAPS
+--------------------------------------------------------------------------------
+  [DONE] Peak limiter. dsp::peak_limiter::PeakLimiter, wired into Decoder as
+         an opt-in output stage (enable_peak_limiter/disable_peak_limiter).
+                                                      C: ixheaacd_peak_limiter.c 333
+  [TODO] Error concealment across AAC and USAC.      C: aac_ec.c, usac_ec.c, ec_rom.c
+  [TODO] Error-resilient tools HCR + RVLC.           C: huff_code_reorder.c, rev_vlc.c
+  [DOC ] src/lib.rs still says "Parametric Stereo, MPEG Surround, USAC and DRC
+         are not implemented" -- three of those four are now partly wrong, and
+         README.md claims AAC-LD/ELD and full USAC, which is wrong the other way.
+         Both need to agree with this document.
+
+================================================================================
+ 3.  THE WORK QUEUE
+================================================================================
+
+Ordering rule used: (1) stop actively misleading callers, (2) finish what is
+half-built before starting anything new, (3) unblock interop, (4) then breadth,
+cheapest-per-unit-of-value first, (5) MPS last -- it is 20% of the reference by
+line count and the least likely to be encountered in real content.
+
+Effort figures are ideal engineering days for one agent working this repo, and
+assume the verification loop in section 6 is used rather than eyeballing output.
+
+--------------------------------------------------------------------------------
+ PHASE 0 -- STOP LYING.  ~2 days.   Do this before any new porting.
+--------------------------------------------------------------------------------
+ [DONE] 0.1  Dealt with the three [FAKE] modules (decoder::mps, encoder::ps,
+      encoder::sbr): gutted the fabricated maths, kept the types, and each
+      method now returns Err(Error::Unimplemented { tool, detail }) naming the
+      plan phase that finishes it. Not feature-gated (no cargo feature flip
+      was needed -- the types stay public, only their one method changed
+      behaviour), but no longer reachable without an explicit unwrap of an
+      error a caller cannot miss. Tests assert the refusal and that output
+      buffers are left untouched.
+ [DONE] 0.2  encoder::usac::mod -- the old decode_acelp_subframe/decode_tcx_frame
+      placeholders on UsacDecoder are gone outright (not merely documented):
+      replaced by real decode_acelp_frame/decode_lpd_frame (see phase 1).
+      classify_frame itself (the signal-classifier stand-in) is untouched --
+      still open, see 3.1.
+ [DONE] 0.3  src/tables/usac_avq.rs wired into src/tables/mod.rs. Still
+      untracked in git pending a user-approved commit; the build compiles it.
+ [DONE] 0.4  src/lib.rs and README.md corrected to name what decode/encode
+      actually cover and point at text/plan.txt for the full audit.
+ [DONE] 0.5  Decoder::decode_frame now auto-detects a LOAS sync (0x2B7) and
+      unwraps the AudioMuxElement's payload (reconfiguring from its
+      StreamMuxConfig's ASC when present), and separately detects an ADIF
+      syncword and consumes the header in place -- since unlike ADTS/LOAS,
+      nothing frames the raw_data_block()s that follow an ADIF header, so
+      decoding just continues from the same BitReader position rather than
+      extracting a payload. Two real end-to-end tests (not just the parsers'
+      own unit tests): encode a real ADTS frame, strip the header, wrap the
+      raw_data_block in each of LATM and ADIF, and assert decode_frame's
+      output is identical to decoding the bare raw_data_block AND that the
+      decoder actually reconfigured (started from the wrong sample
+      rate/channel count, wound up at the right one).
+ [TODO] 0.6  tools/verify_corpus.sh is not yet extended into the per-subsystem
+      harness section 6 describes.
+
+--------------------------------------------------------------------------------
+ PHASE 1 -- FINISH USAC LPD (decode).  ~12 days.
+--------------------------------------------------------------------------------
+ The active work area; commit 315e281 stopped mid-way through it.
+ Target modules: src/decoder/usac/{acelp,tcx,fac,lpd}.rs, src/tables/usac_acelp.rs
+
+ [DONE] 1.1  ROM extracted by tools/extract_acelp_rom.py (not hand-transcribed,
+      per rule R4) into src/tables/usac_acelp.rs: GAIN_TABLE (256),
+      INTERPOL_FILT (65), FIR_LP_FILT (13, bass post-filter, not yet consumed),
+      GAMMA_TABLE (17), plus the ORDER/LEN_SUBFR/pitch-grid constants.
+ [DONE] 1.2  acelp.rs: preemphasis/deemphasis/synthesis/residual/pitch_sharpening,
+      each with a round-trip property test (residual is proven the exact
+      inverse of synthesis, not just "close").
+ [DONE] 1.3  Algebraic codebook: the 1/2/3/4-pulses-per-track ladder, ported as
+      place_1/place_2/place_3/place_4(_section) plus decode_pulses() switching
+      on CODE_BITS_PER_MODE. Covered by a per-mode pulse-count test.
+ [DONE] 1.4  Adaptive codebook: PitchRange::absolute() for the three-region lag
+      decode, AcelpDecoder::adaptive_codebook() for the 4x-oversampled
+      fractional interpolation, with a persistent excitation history buffer
+      (EXC_HISTORY) rather than the reference's raw pointer arithmetic.
+ [DONE] 1.5  decode_gains() (energy-predicted innovation gain) plus the full
+      post-processing chain in decode_subframe(): pitch sharpening, voicing-
+      weighted gain smoothing against gain_threshold, the cpe comb filter, LPC
+      synthesis, frame-level deemphasis.
+ [DONE] 1.6  SubframeParams::parse / AcelpFrame::parse, bit-width-exact per
+      CELP_INDEX_BITS, with a test asserting the reader consumes exactly the
+      field widths the reference's table implies.
+ [INVESTIGATED, still TODO] The asymmetric-overlap MDCT ixheaacd_acelp_mdct/
+      ixheaacd_acelp_mdct_main was investigated in depth: its pre/post-rotation
+      twiddle tables were reverse-engineered numerically to Q31 precision
+      (pre_cos[i]=cos(pi*(4i+1)/(4L)), pre_sin[i]=-sin(pi*(4i+1)/(4L)),
+      post_cos[k]=cos(pi*k/(2*nlength)), post_sin[k]=-sin(pi*k/(2*nlength)),
+      nlength=L/2), and the _main wrapper's index arithmetic decoded (it emits
+      only 2l+m of a would-be 2(l+m) output, where l=2*fac_length is the
+      overlap length and m the steady middle -- the missing 2N-(2l+m)=m samples
+      are covered by the next frame's own overlap rather than computed here).
+      What could NOT be safely determined is ixheaacd_complex_fft_p2_dec's
+      exact sign/scaling convention: it is a hand-optimized, saturating,
+      digit-reverse-addressed split-radix fixed-point FFT, and its twiddle
+      table (ixheaacd_twiddle_table_fft_32x32) stores (-sin,cos) pairs rather
+      than the (cos,sin) a naive reading would expect -- getting its direction
+      wrong would silently produce a different (but internally self-consistent,
+      so test-proof) transform, not a compile error or a test failure. With no
+      byte-exact reference vector to check against (no working encoder emits
+      real ISO USAC framing yet -- see phase 2), guessing here was judged worse
+      than leaving it undone: a self-consistency test (fast vs. brute-force of
+      the SAME assumed formula) cannot catch a wrong assumption, only a wrong
+      transcription of it. Do not attempt this without either (a) a byte-exact
+      C-reference-decoded LPD/TCX test vector to check against, or (b) reading
+      ixheaacd_complex_fft_p2_dec/_p3 closely enough to derive the convention
+      from the algorithm's structure rather than from its constant tables.
+      Recommended alternative for whoever picks this up: skip matching
+      libxaac's specific fast-FFT implementation entirely and instead implement
+      TCX synthesis against this crate's own already-verified
+      dsp::imdct::ImdctContext (same mathematical operation, standard N-point
+      IMDCT, already checked against a brute-force reference in
+      imdct_reference) plus the standard sine-window overlap-add this codebase
+      already uses correctly elsewhere (dsp::window, dsp::filterbank) -- per
+      rule R1, port the algorithm ISO/IEC 23003-3 specifies, not libxaac's
+      specific fixed-point fast-transform code path.
+ [PART] 1.7  TCX's pure spectral-shaping building blocks are ported into the new
+      src/decoder/usac/tcx.rs (this session): weight_lpc (bandwidth expansion,
+      ixheaacd_lpc_coeff_wt_apply), spectral_envelope_gains (perceptual filter
+      magnitude response via FFT, ixheaacd_lpc_to_td), noise_shape (two-envelope
+      cross-fade + MDCT-fold reorder, ixheaacd_noise_shaping), and
+      low_frequency_deemphasis (ixheaacd_low_fq_deemphasis). 6 tests, including
+      a resonance-shape check and a bit-exact reorder check against the
+      reference's index arithmetic. Still missing, and the reason
+      decode_lpd_frame() keeps refusing non-ACELP lpd_mode: the asymmetric-
+      overlap MDCT (ixheaacd_acelp_mdct_main, not a plain square MDCT -- TCX's
+      overlap regions differ in length from its transform length), the sine-
+      window overlap-add across an ACELP/TCX/FD mode switch, and the mode_prev
+      / exc_prev state that carries across frame boundaries. See the module's
+      own docs for the detailed accounting.
+ [PART] 1.8  LPD superframe top level: LpdModeSet::parse (the mod[] ladder) and
+      UsacDecoder::interpolate_lpc (LSF-domain interpolation across the 4
+      subframes, proven stable by an impulse-response decay test) are done.
+      FAC at mode boundaries and the bass post-filter are not (blocked on 1.7).
+ [DONE] 1.9  UsacDecoder::decode_acelp_subframe / decode_tcx_frame are gone;
+      replaced by decode_acelp_frame (superframe-shaped, per the note that the
+      old per-subframe signature didn't fit) and decode_lpd_frame (reads a
+      whole LPD frame off a BitReader).
+ Deliverable: an all-ACELP LPD superframe decodes end to end from a real
+ bitstream (src/decoder/usac/mod.rs tests), with round-trip and stability
+ property tests. Remaining before "LPD decode" as a whole is [DONE]: TCX (1.7)
+ and the mode-mixing/FAC/bass-post-filter parts of 1.8. usac_lpd_progress
+ memory updated to match.
+
+--------------------------------------------------------------------------------
+ PHASE 2 -- USAC INTEROP.  ~10 days.   The interop blocker.
+--------------------------------------------------------------------------------
+ 2.1  UsacConfig(): sampling frequency index, channel config, the element list
+      (SCE/CPE/LFE/EXT), UsacCoreConfig, SbrConfig, Mps212Config stubs, plus
+      the escape-coded fields.                    C: init_config.c, process.c  [3d]
+ 2.2  UsacFrame(): usacIndependencyFlag, per-element payloads, the FD/LPD core
+      mode bit, extension elements.               C: spectrum_dec.c, process.c [3d]
+ 2.3  Complex prediction stereo -- USAC's actual stereo tool. Rust FD does M/S
+      only today.                                 C: ext_ch_ele.c 1,069        [3d]
+ 2.4  Keep the VUSC container as a debug/test path, clearly marked; do not
+      delete it (the round-trip tests are genuinely useful) but stop it being
+      the only way in.                                                         [1d]
+ 2.5  Encoder mirror: iusace_write_bitstream.c -> real USAC framing.
+ Deliverable: a stream from a third-party xHE-AAC encoder decodes.
+
+--------------------------------------------------------------------------------
+ PHASE 3 -- USAC LPD ENCODE.  ~12 days.
+--------------------------------------------------------------------------------
+ 3.1  Signal classifier -- replace classify_frame.  C: signal_classifier.c +_rom [3d]
+ 3.2  Open-loop then closed-loop pitch search.      C: acelp_enc.c, acelp_tools.c[3d]
+ 3.3  Algebraic codebook search (depth-first over tracks) + gain quantisation.  [2d]
+ 3.4  TCX encode + FAC generation.                  C: tcx_enc.c, enc_fac.c,
+                                                       fd_fac.c                [3d]
+ 3.5  LPD mode decision (ACELP vs TCX20/40/80 per superframe).
+                                                    C: lpd_enc.c, lpd_utils.c  [2d]
+ 3.6  AVQ encode: lattice nearest-neighbour search + index coding, closing out
+      the second LSF quantisation stage.            C: avq_enc.c, lpc_avq.c    [2d]
+
+--------------------------------------------------------------------------------
+ PHASE 4 -- HE-AAC ENCODE (SBR then PS).  ~18 days.  Highest external value.
+--------------------------------------------------------------------------------
+ The decoder does HE-AAC v1 and v2; the encoder does neither. Closing this makes
+ the crate a two-way HE-AAC codec, which is what most callers actually want.
+ 4.1  SBR QMF analysis for the encoder + framing/transient detection.
+                              C: sbr_qmf_enc.c, tran_det.c, frame_info_gen.c   [4d]
+ 4.2  Envelope estimation + noise floor estimation + inverse filtering
+      estimation + tonality correction.
+                              C: env_est.c, noise_floor_est.c,
+                                 inv_filtering_estimation.c, ton_corr.c        [5d]
+ 4.3  Missing harmonics detection.        C: missing_harmonics_det.c           [2d]
+ 4.4  Envelope coding + SBR payload writing + CRC.
+                              C: code_envelope.c, write_bitstream.c, crc.c     [3d]
+ 4.5  Wire into encoder/engine.rs as a fill element; the decoder side already
+      reads exactly this, so 4.1-4.4 self-verify by round-trip.                [1d]
+ 4.6  PS encode: hybrid-domain IID/ICC/IPD extraction, quantisation, payload.
+                              C: ps_enc.c, ps_bitenc.c, hybrid.c              [3d]
+
+--------------------------------------------------------------------------------
+ PHASE 5 -- eSBR DECODE.  ~10 days.  Required for real xHE-AAC content.
+--------------------------------------------------------------------------------
+ 5.1  Harmonic transposer, time-domain path.      C: hbe_trans.c 1,606         [4d]
+ 5.2  Harmonic transposer, DFT path + its FFT sizes.
+                                    C: hbe_dft_trans.c, common/esbr_fft.c      [3d]
+ 5.3  PVC.                          C: pred_vec_block.c + pvc_rom.c            [2d]
+ 5.4  eSBR envelope calc + polyphase + inter-TES.
+                                    C: esbr_envcal.c, esbr_polyphase.c         [2d]
+ [DONE] 5.5  SBR CRC. decoder::sbr::crc ports the CRC-10 bit-serial checksum
+      (ixheaacd_calc_chk_sum/ixheaacd_sbr_crc/ixheaacd_sbr_crccheck) faithfully,
+      verified against a disposable BitReader clone so checking never consumes
+      the payload it protects (4 tests: self-consistency, single-bit-flip
+      detection, non-consumption, truncated-stream clamp). Now wired for real:
+      SbrDecoder::decode_extension takes a payload_bits_remaining count from
+      its caller (Decoder::parse_fill_element/decode_sbr_payload, which already
+      knew the fill element's declared byte length) and rejects a payload
+      whose CRC does not match with the same CorruptedFrame error any other
+      malformed SBR payload gets -- the core signal still decodes that frame,
+      just without band replication. 2 more tests exercise the real
+      decode_extension path directly: a mismatched CRC is refused with the
+      CRC-specific error, and a correctly computed one is not.
+                                                                C: sbr_crc.c
+
+--------------------------------------------------------------------------------
+ PHASE 6 -- uniDRC.  ~16 days.
+--------------------------------------------------------------------------------
+ [PART] 6.1  Static payload (config): DRC sets, coefficients, channel layout,
+      loudness info. decoder::drc::loudness_info (new) ports
+      impd_parse_loudness_info / impd_parse_loudness_measure /
+      impd_dec_method_value in full: the shared linear loudness scale, the
+      three-segment LoudnessRange encoding, MixingLevel/RoomType's own narrow
+      fields, sample/true peak level decode, and the derived
+      anchor/expert-loudness presence flags. 6 tests, including the segment
+      boundaries (128/129, 204/205) and that an unknown method_def or reserved
+      measurement_system is rejected rather than misparsed.
+      decoder::drc::channel_layout (new) ports impd_parse_ch_layout: the
+      base_channel_count/layout_signaling_present/defined_layout fields, and
+      for an explicit (non-named) layout, per-channel speaker positions with
+      LFE detection at the two CICP LFE position codes (3, 26). The
+      reference's cross-record base_channel_count consistency check (threaded
+      through shared parse-session state this crate doesn't have yet) is
+      exposed as an explicit Option<u8> argument at the call site instead. 5
+      tests. decoder::drc::downmix_instructions (new) ports
+      impd_parse_dwnmix_instructions: both incompatible per-pair coefficient
+      encodings (version 0's split LFE/non-LFE 4-bit tables, version 1's
+      single 32-entry 5-bit table plus a transmitted offset chosen from four
+      formulas, one of which -- selector 3 -- derives the offset from the
+      coefficients' own power sum, so the dB-to-linear conversion has to wait
+      until every raw coefficient and the offset are both in hand). 7 tests,
+      including the LFE/non-LFE table split for the same code, the mute
+      sentinel (-1000 dB), and that an undefined offset selector is rejected.
+      decoder::drc::gain_modifiers (new) ports
+      impd_parse_gain_set_params_characteristics (a gain sequence's DRC curve:
+      a CICP index, or from version 1 a curve split into two independently
+      indexed halves) and impd_dec_gain_modifiers (per-band overrides: target
+      characteristic, attn/ampl scaling, gain offset, plus a shape filter for
+      single-band gain sets only). Deliberately does not reproduce the
+      reference's uninitialized-field hazard -- ia_gain_modifiers_struct
+      leaves a value field unwritten whenever its flag is clear, so a caller
+      that skips the flag check reads stale memory; every optional field here
+      is a real Option instead, making that mistake unrepresentable. 7 tests,
+      including that a multi-band gain set never reads a shape-filter bit at
+      all (not just that it decodes to "absent") and that version 0's single
+      shared scaling/offset really does broadcast to every band unchanged.
+      decoder::drc::gain_set_params (new) assembles impd_parse_gain_set_params:
+      band structure (crossover-frequency vs. subband-index splits, one per
+      boundary between bands), and the one genuinely cross-record piece of
+      state in this whole file -- gain_seq_idx, numbered once consecutively
+      across every gain set in a uniDrcConfig(), threaded through as an
+      explicit &mut u32 (the direct idiomatic equivalent of the reference's
+      in/out pointer parameter, since it really is shared mutable state across
+      sibling calls rather than something one record can own). 6 tests,
+      including the version-0-vs-1 auto-increment/explicit-index shapes and
+      the constant-profile short-circuit that skips band structure entirely.
+      None of the five modules has a caller yet -- uniDrcConfig()'s
+      surrounding structure (DRC sets, EQ) is the rest of this file and is
+      still [TODO], and nothing in the decode path parses the uniDRC extension
+      payload that would carry a real loudnessInfo()/channelLayout()/
+      downmixInstructions()/gainSetParams() yet.
+                                                   C: static_payload.c 2,501 [~2d left]
+ 6.2  Dynamic payload (per-frame gains) + delta coding.
+                                    C: dynamic_payload.c, extr_delta_coded_info.c [3d]
+ 6.3  Gain decoder + interpolation + application.
+                                    C: gain_dec.c, gain_decoder.c              [2d]
+ 6.4  DRC set selection process (the part that picks which DRC set applies to
+      the playback configuration).  C: selection_process*.c 3,215              [3d]
+ 6.5  Loudness control + peak limiter.  C: loudness_control.c, peak_limiter.c   [2d]
+ 6.6  Parametric DRC, EQ, filter bank, shape filter, multiband.
+                                    C: parametric_dec.c, eq.c, filter_bank.c,
+                                       shape_filter.c, multiband.c             [3d]
+ 6.7  Encode side: gain calculator, gain encoder, mux.
+                                    C: encoder/drc_src/*                       [4d]
+
+--------------------------------------------------------------------------------
+ PHASE 7 -- ERROR RESILIENCE, CONCEALMENT, LONG TAIL.  ~12 days.
+--------------------------------------------------------------------------------
+ 7.1  Error concealment (AAC + USAC): frame repeat/interpolate, mute ramp.
+                                    C: aac_ec.c, usac_ec.c, ec_rom.c           [3d]
+ 7.2  HCR.                          C: huff_code_reorder.c 1,906               [3d]
+ 7.3  RVLC.                         C: rev_vlc.c 1,755                         [3d]
+ 7.4  LTP -- apply it instead of skipping it.  C: lt_predict.c 531             [1.5d]
+ [DONE] 7.5  Coupling channel elements. decoder::engine::CouplingChannelElement
+      (new) really decodes the header, target list and per-target gains --
+      cc_gain_scale[k]=2^(step[k]/24) for step=[3,6,12,24], confirmed
+      numerically against ixheaacd_common_rom.c's Q29 table to 2e-9 relative
+      error -- and the coupling channel's own ICS data (dequantized, not
+      skipped), plus apply_coupling_gain() for the actual scaled time-domain
+      add (ixheaacd_dec_couple_channel). This also fixed a real bit-alignment
+      bug in the code it replaced: the old skip_coupling_element read one
+      spurious "common_gain_element_present" bit per target whenever
+      ind_sw_cce_flag was SET, which the reference never reads in that case
+      (it only reads that bit, then immediately refuses, when the flag is
+      CLEAR) -- so every stream with more than one coupled target and
+      ind_sw_cce_flag=1 was desynchronising the rest of the frame after its
+      CCE. ind_sw_cce_flag==0 (per-band gain envelopes) is refused via
+      Error::Unimplemented, which is not a coverage gap: the reference's own
+      ixheaacd_dec_coupling_channel_element reads that flag and unconditionally
+      returns IA_XHEAAC_DEC_EXE_FATAL_UNIMPLEMENTED_CCE without decoding
+      further, so this matches libxaac's actual supported scope exactly.
+      4 new tests, including one that reproduces the fixed bit-alignment bug's
+      shape and one verifying the refusal fires for the right reason (real
+      ics_data supplied, so the only way to fail is the check under test).
+      UPDATE 2026-08-28: wired for real. decode_raw_data_block now builds a
+      per-frame `element_instance_tag -> (first channel index, channel
+      count)` map as it decodes each SCE/CPE/LFE (the tags were already being
+      read and discarded), and a CCE is queued rather than decoded-and-
+      dropped. Decoder::synthesize's per-channel body (deinterleave/TNS/
+      IMDCT/windowing/overlap-add) is factored into
+      Decoder::synthesize_channel_data so a coupling channel's own spectrum
+      can run through the identical chain; its overlap-add tail persists
+      across frames in a new `cce_overlap: HashMap<tag, (Vec<f32>,
+      WindowShape)>` keyed by the CCE's *own* element_instance_tag (distinct
+      from its targets' tags), since a CCE is not one of the fixed
+      `self.channels` slots and can appear or disappear frame to frame.
+      Decoder::mix_coupling_channels then resolves each target's tag through
+      the map and calls apply_coupling_gain(), splitting a channel-pair
+      target's two gains across the right two channels and silently skipping
+      (not erroring) a target tag no element in this frame actually declared.
+      One new end-to-end test drives this against an independent oracle: the
+      same spectrum synthesized separately through a fresh filterbank must
+      equal what actually landed in the target channels' PCM after mixing,
+      for both a channel-pair target and an unresolved-tag target that must
+      be left untouched.                                    C: multichannel.c
+ [DONE] 7.6  Multichannel downmix to stereo. decoder::aac::downmix (new) ports
+      ixheaacd_dec_downmix_to_stereo's fixed matrix for all four layouts
+      (5.0/5.1/7.0/7.1), reverse-derived from down_mix_martix[4][2][8]'s Q30
+      values. Investigating which column is which channel turned up a real
+      finding: for three of the four layouts a shared column (center, and LFE
+      where present) splits evenly between the outputs and every other column
+      pans hard with zero crosstalk, exactly as expected -- but 7.1's columns
+      2 and 3 do neither; they feed both outputs at two different, mirrored
+      weights (0.211/0.070 and 0.070/0.211), which doesn't match a plain
+      center/LFE pair. Rather than assert an unverified channel-name guess for
+      those two columns, the module documents the ambiguity and the function
+      itself is channel-name-agnostic (just a matrix + column order contract).
+      6 tests, including one pinning the 7.1 asymmetry's exact values so a
+      future correction has to consciously touch it, not silently regress it.
+      UPDATE 2026-08-28: wired for real, but narrower than the reference on
+      purpose. Decoder::enable_downmix_to_stereo/disable_downmix_to_stereo/
+      downmix_to_stereo_enabled add it as a fourth opt-in output stage
+      alongside DRC/the peak limiter/SBR, applied in the new
+      Decoder::write_output_pcm (factored out of decode_frame's tail so the
+      decision and permutation are directly testable without a real
+      multichannel bitstream, which this crate's own encoder cannot produce).
+      It only engages for the three IMPLICIT (PCE-less) channelConfiguration
+      values whose element decode order the standard itself fixes --
+      FiveChannel/FivePointOne/SevenPointOne, i.e. Ch5_0/Ch5_1/Ch7_1 -- and
+      only when the frame actually produced that many channels; Ch7_0 has no
+      implicit channelConfiguration at all (7 discrete channels with no LFE
+      only exists behind an explicit PCE), so it stays unreachable from this
+      path by construction. The real gap this doesn't close: a
+      program_config_element() declaring its own channel roles is still just
+      consumed and ignored (see 2.2), so an explicit-PCE multichannel stream
+      still doesn't downmix -- only the implicit-config case does. The new
+      downmix_decode_order() is the fixed permutation from the standard's
+      centre-first implicit decode order (SCE(C), CPE(L,R), CPE(Ls,Rs)[,
+      CPE(Lrs,Rrs)][, LFE]) into the matrix's own front-pair-first column
+      order -- derived from both orderings, not guessed, and worth writing
+      down because feeding decode-order channels straight into the matrix
+      without this permutation would have been exactly the kind of
+      confidently-wrong answer this port's rules forbid (R5). One new test
+      checks the permutation two independent ways (via the wired path and via
+      a hand-built column order) and that a channel count outside the four
+      layouts (stereo) passes through unchanged even with downmixing on.
+                                                              C: multichannel.c
+ [DONE] 7.7  Decoder peak limiter. dsp::peak_limiter::PeakLimiter ports
+      ixheaacd_peak_limiter_process_float faithfully: the look-ahead delay
+      line, the lazy-rescan windowed-max tracker, and the two-stage attack/
+      release gain smoothing (4 tests: a black-box "never exceeds threshold"
+      property test, a brute-force-twin test isolating the windowed-max
+      bookkeeping). Now wired into Decoder as opt-in
+      (enable_peak_limiter/disable_peak_limiter/peak_limiter_enabled),
+      exactly like DRC: off by default, so every existing test's exact sample
+      values are untouched (confirmed -- the whole suite still passes
+      unchanged with the feature present but disabled). One more test drives
+      a full-scale tone through both an unlimited and a limiter-enabled
+      Decoder and checks the two global properties that survive the look-ahead
+      delay's index shift: the limiter measurably engages, and it never raises
+      the stream's overall peak.                          C: peak_limiter.c
+
+--------------------------------------------------------------------------------
+ PHASE 8 -- AAC-LD / AAC-ELD.  ~8 days.
+--------------------------------------------------------------------------------
+ 8.1  480/512 transform sizes and the low-delay window.  C: mdct_480.c         [2d]
+ 8.2  LD core decode + encode paths.                                           [3d]
+ 8.3  ELD SBR (the delay-aligned SBR variant) + LD-MPS config.
+                                    C: ld_mps_config.c, ld_mps_dec.c           [3d]
+
+--------------------------------------------------------------------------------
+ PHASE 9 -- MPEG SURROUND.  ~35 days.  Last, deliberately.
+--------------------------------------------------------------------------------
+ 9.1  Config + bitstream parse.        C: mps_parse.c, mps_bitdec.c            [6d]
+ 9.2  Polyphase + hybrid filterbanks.  C: mps_polyphase.c, mps_poly_filt.c,
+                                          mps_hybrid_filt.c                    [5d]
+ 9.3  M1/M2 computation for each tree config (5151, 5152, 525, 727, 757) and
+      their application.               C: mps_calc_m1m2_*.c, mps_apply_m*.c    [8d]
+ 9.4  Decorrelator.                    C: mps_decorr.c                         [3d]
+ 9.5  Temporal shaping: TES/TP, envelope reshaping, smoothing, tonality.
+                                       C: mps_temp_*.c, mps_reshape_bb_env.c,
+                                          mps_smoothing.c, mps_tonality.c      [5d]
+ 9.6  Residual coding path.            C: mps_res_*.c                          [3d]
+ 9.7  ROM extraction (8,286 lines -- script it, do not transcribe).            [1d]
+ 9.8  MPS encode.                      C: encoder/ixheaace_mps_*.c             [4d]
+
+================================================================================
+ 4.  OPTIMISATION TRACK  (continuous, not a phase)
+================================================================================
+
+Already landed, and the bar every new kernel is held to:
+  - IMDCT via quarter-length complex FFT (was O(N^2) + an 8 MB table).
+  - Radix-4 FFT with NEON and AVX/FMA butterflies behind runtime detection;
+    twiddles stored per length-class, contiguous, so vector loads never gather.
+  - Rayon across channels in the encoder rate loop, and across frame chunks in
+    the decoder, with a position-independent PNS mode so parallel output is
+    byte-identical to sequential.
+  - Warm-started scalefactor search; tabulated inverse power law.
+  - 64-byte aligned buffers (aligned-vec) throughout the hot path.
+  - unsafe denied crate-wide with exactly one audited exception (dsp::simd),
+    every kernel checked against its scalar twin in tests.
+
+Queued, in expected-payoff order:
+  O1  ACELP synthesis and residual filters (Phase 1) are order-16 IIR/FIR inner
+      loops -- the C hand-unrolls them 4x. Write them once with explicit FMA
+      chains; they are the LPD hot path.
+  O2  QMF analysis/synthesis: currently scalar per slot. The 64-band synthesis
+      is the SBR hot path and is a natural 4-wide/8-wide target.
+  O3  Envelope adjustment (sbr/hf.rs::adjust) is elementwise over a 64x32 grid
+      -- trivially vectorisable, currently scalar.
+  O4  The arithmetic coder is inherently serial per symbol, but context
+      derivation over the previous frame's spectrum is not; hoist and vectorise
+      that.
+  O5  Rayon at the element level inside a frame (SCE/CPE are independent after
+      the shared header) -- today parallelism is only across frames/channels.
+  O6  Encoder psychoacoustics: spreading is a two-pass IIR over bands, cheap to
+      vectorise across the channel dimension instead of the band dimension.
+  O7  Per-length FFT specialisation (const-generic radix-4 for 64/128/512/1024)
+      to kill the inner loop bounds and let LLVM fully unroll.
+  O8  Revisit `panic = "abort"` + `overflow-checks = false` in release: correct
+      for this workload, worth a comment in Cargo.toml saying why.
+  O9  A no_std path. `std` is already a feature; nothing in the DSP needs it.
+
+Standing rule for this track: no SIMD kernel lands without (a) a scalar twin,
+(b) a test asserting they agree over every span the callers use, and (c) a
+criterion benchmark showing the win on this machine. dsp/simd.rs's own module
+docs record that with -C target-cpu=native LLVM already matches several of these
+kernels -- they earn their place in builds that do not name a CPU. Measure
+before assuming.
+
+================================================================================
+ 5.  IDIOMATIC-RUST RULES THIS PORT FOLLOWS
+================================================================================
+
+These are already the de-facto conventions in the ported subsystems; writing
+them down so later phases stay consistent.
+
+ R1  Port the algorithm, not the C. The reference's 4x-unrolled loops, its
+     `WORD32 *ptr_scratch` carving, its `ixheaacd_`-prefixed free functions and
+     its handle structs are C solutions to C problems. Express the DSP as
+     slices, iterators and small owned state structs.
+ R2  One float path. libxaac ships fixed-point and float twins of most files;
+     this crate implements float only, and marks the fixed-point twin [N/A].
+     dsp/math.rs keeps the fixed-point ops that ported *constants* depend on.
+ R3  State is owned, not scratch-carved. Where C threads a scratch pointer,
+     hold a buffer in the struct and reuse it -- no allocation in the frame loop.
+ R4  Tables are generated, not transcribed. tools/extract_rom.py and
+     tools/extract_sfb.py read the C source; extend them for each new ROM.
+     A hand-typed table is a bug waiting for a reference update.
+ R5  Errors are typed and total. No sentinel returns; parse errors carry what
+     failed. An unsupported tool returns Err, never a plausible-looking wrong
+     answer -- this is the rule Phase 0 enforces retroactively.
+ R6  Document the delta. Where the Rust deliberately narrows the reference
+     (e.g. usac/fd.rs's noise filling), say so in the module docs, as those
+     modules already do. That is how [PART] stays honest.
+ R7  unsafe stays confined to dsp::simd, with the two obligations (feature
+     availability, bounds-before-pointer) discharged and documented per kernel.
+ R8  Every new subsystem ships with its verification oracle (section 6) in the
+     same change, not later.
+
+================================================================================
+ 6.  VERIFICATION STRATEGY
+================================================================================
+
+ 6.1  The three oracles, in order of strength:
+      (a) The C reference itself. c/libxaac builds (its ARM64 asm needs Mach-O
+          symbol prefixes and its CMake omits a translation unit -- both known).
+          Decode the same stream with both, compare sample by sample.
+      (b) Round-trip. Encode then decode in Rust; assert SNR bounds. Catches
+          encoder/decoder disagreement, not disagreement with the standard.
+      (c) Property tests. synthesis o residual == identity; MDCT o IMDCT == TDAC;
+          LSF ordering preserved through quantisation. Catches algebra errors
+          early and cheaply, and is the right first oracle for Phase 1's tools.
+ 6.2  On "bit-exact". Bit-exactness against libxaac would mean reproducing its
+      fixed-point saturation and rounding at every stage -- a different codec,
+      and one that forecloses most of section 4. What is bit-exact today is
+      entropy decoding, because it uses the reference's own tables and search.
+      Everything downstream is exact to within float rounding; the corpus
+      harness measured 2 LSB max divergence and 69% of samples identical over a
+      two-minute stereo stream, which is the normal spread between conformant
+      decoders. Streams carrying PNS diverge by construction (each decoder
+      synthesises its own noise) and the harness reports per-frame PNS energy
+      so a low SNR row can be read for what it is.
+ 6.3  Per-phase acceptance:
+      Phase 1  property tests per tool, then an LPD superframe that decodes
+               without divergence over 1,000 frames.
+      Phase 2  a third-party xHE-AAC stream decodes; compare against libxaac.
+      Phase 4  encoder output decoded by libxaac AND by ffmpeg, not just by us.
+      Phase 5  eSBR streams compared against libxaac at the QMF-domain boundary,
+               not only at PCM, so transposer errors are localised.
+      Phase 6  DRC gains compared against libxaac's per-frame gain sequence.
+      Phase 9  per-tree-config comparison; MPS errors do not localise from PCM.
+ 6.4  Extend tools/verify_corpus.sh to take a subsystem name and select the
+      right oracle and corpus, so each phase's acceptance is one command.
+
+================================================================================
+ 7.  RISKS AND DECISIONS ALREADY TAKEN
+================================================================================
+
+ D1  Float-only, not bit-exact against libxaac's fixed point. Taken; see 6.2.
+ D2  The Rust public API does not mirror ixheaacd_api.c's get/set state machine.
+     Taken; typed config + Decoder::decode_frame instead.
+ D3  The VUSC container exists because ADTS cannot express AOT 42 (its profile
+     field is 2 bits, so AOT 4 is the ceiling). It was a correct local decision
+     and is a global blocker -- Phase 2 supersedes it without deleting it.
+ R1  Risk: MPS is 35K lines and 20% of the reference. If it is never going to be
+     used, deleting decoder/mps entirely is a legitimate alternative to Phase 9,
+     and is cheaper than a half-port. Decide before starting, not during.
+ R2  [DONE, 2026-08-27] Risk was: the three [FAKE] modules (decoder::mps,
+     encoder::sbr, encoder::ps) had been in the public API long enough that
+     fixing them was a breaking change. Taken: the crate is 0.1.0, so the break
+     was taken now rather than deferred. Their methods now return
+     Err(Error::Unimplemented) instead of a fabricated result; the types stay,
+     so this was not the re-export removal originally sketched in Phase 0.1 --
+     it was judged sufficient and less disruptive to keep the types public and
+     change only what the methods return.
+ R3  Risk: iusace_rom.c is 15,083 lines of tables. Script the extraction (R4) in
+     Phase 3 or it will dominate the schedule.
+ R4  [DONE, 2026-08-27] Risk was: Phase 1's placeholder signatures
+     (decode_acelp_subframe / decode_tcx_frame) were shaped wrong for the real
+     algorithm. Taken: they are gone, replaced by decode_acelp_frame (superframe-
+     shaped) and decode_lpd_frame (reads a whole LPD frame off a BitReader).
+
+================================================================================
+ 8.  SUMMARY
+================================================================================
+
+  Ported so far        ~32.0K lines of Rust covering AAC-LC decode, HE-AAC v1+v2
+                       decode (with a real, wired SBR CRC-10 check now), a
+                       working opt-in output peak limiter, AAC-LC encode with
+                       a real psychoacoustic model, the float DSP layer,
+                       USAC-FD both directions, USAC's ACELP speech core end
+                       to end plus its RE8/Gosset AVQ lattice decode for
+                       qn<=4, legacy DRC plus five real uniDRC static-payload
+                       records (loudnessInfo/channelLayout/downmixInstructions/
+                       gainSetParams and its sub-pieces), LATM/ADIF framing,
+                       the fixed 5.0/5.1/7.0/7.1 downmix matrix, and real (if
+                       not yet fully mixed) coupling-channel decode.
+  Remaining            156 files / 117.7K C lines marked [TODO], plus the
+                       unfinished share of 33 [PART] files and 1 [FAKE] one --
+                       call it ~123K lines of reference, across 9 phases and
+                       roughly 130 engineer-days, projecting to ~30K lines of
+                       Rust at this port's observed 25-40% ratio.
+  Phase 0              [DONE] except 0.6 (verify_corpus.sh harness extension),
+                       all landed 2026-08-27. Every confidently-wrong-answer
+                       site is closed (0.1-0.4), and both previously-dark
+                       parsers are now reachable from Decoder::decode_frame
+                       (0.5).
+  Doing now            Phase 1 (USAC LPD decode): ACELP is [DONE] end to end
+                       (1.1-1.6, 1.9); TCX + FAC (1.7) is next, then the
+                       mode-mixing/bass-post-filter remainder of 1.8. The memory
+                       usac_lpd_progress already carries its plan.
+  Highest value        Phase 4 (HE-AAC encode) -- the decoder already does v1
+                       and v2, so the encoder is the asymmetry a caller hits.
+  Do last / maybe      Phase 9 (MPS). Decide whether to port or delete.
+
+================================================================================
+ APPENDIX A -- EVERY C FILE, ITS RUST TARGET, ITS STATUS
+================================================================================
+
+ All 283 .c files in c/libxaac (decoder/, decoder/drc_src/, encoder/,
+ encoder/drc_src/, common/). Architecture-specific selector files under
+ decoder/{armv7,armv8,x86,x86_64,generic}/ and the test/ harness are excluded
+ -- see the [N/A] definition in section 0.
+
+ LOC   STATUS  C FILE                                  RUST TARGET / NOTE
+
+--------------------------------------------------------------------------------
+ DECODER / AAC-LC CORE   (25 files, 22,146 lines)
+--------------------------------------------------------------------------------
+  4455  [PART] ixheaacd_rom.c                         tables/* -- AAC ROM done; tables/usac_acelp.rs::GAIN_TABLE extracted (Phase 1.1 done)
+  3045  [DONE] ixheaacd_aac_rom.c                     tables/huffman.rs (tools/extract_rom.py)
+  1906  [TODO] ixheaacd_huff_code_reorder.c           HCR -- Phase 7.2
+  1755  [TODO] ixheaacd_rev_vlc.c                     RVLC -- Phase 7.3
+  1363  [DONE] ixheaacd_block.c                       decoder/aac/{ics,huffman,dequant}.rs
+  1236  [DONE] ixheaacd_channel.c                     decoder/aac/channel.rs, decoder/engine.rs
+  1208  [DONE] ixheaacd_lpfuncs.c                     dsp/{filterbank,window}.rs (float path)
+  1147  [DONE] ixheaacd_aacdecoder.c                  decoder/engine.rs
+   657  [DONE] ixheaacd_basic_ops.c                   dsp/math.rs
+   656  [DONE] ixheaacd_decode_main.c                 decoder/engine.rs
+   531  [SKIP] ixheaacd_lt_predict.c                  ics.rs::skip_ltp_data parses, never applies -- Phase 7.4
+   515  [DONE] ixheaacd_pns_js_thumb.c                decoder/aac/pns.rs
+   457  [TODO] ixheaacd_aac_ec.c                      error concealment -- Phase 7.1
+   448  [DONE] ixheaacd_aac_tns.c                     decoder/aac/tns.rs
+   422  [DONE] ixheaacd_multichannel.c                decoder::engine::CouplingChannelElement + mix_coupling_channels (CCE, real end to end) and decoder::aac::downmix + Decoder::enable_downmix_to_stereo (fixed-matrix downmix, wired for the three implicit channel configs) -- Phase 7.5/7.6; explicit-PCE channel-role mapping still open
+   398  [DONE] ixheaacd_common_lpfuncs.c              decoder/engine.rs (DSE / fill / element tags)
+   354  [PART] ixheaacd_common_rom.c                  tables/* -- subset
+   333  [DONE] ixheaacd_peak_limiter.c                dsp::peak_limiter::PeakLimiter, wired into Decoder as an opt-in stage (enable_peak_limiter) -- Phase 7.7
+   314  [DONE] ixheaacd_tns.c                         decoder/aac/tns.rs
+   306  [DONE] ixheaacd_longblock.c                   decoder/aac/ics.rs (section + scalefactor data)
+   236  [DONE] ixheaacd_stereo.c                      decoder/aac/stereo.rs (M/S + intensity)
+   196  [DONE] ixheaacd_basic_funcs.c                 dsp/math.rs
+    96  [DONE] ixheaacd_huff_tools.c                  decoder/aac/huffman.rs
+    80  [DONE] ixheaacd_hufftables.c                  tables/huffman_rom.rs
+    32  [TODO] ixheaacd_ec_rom.c                      error concealment tables -- Phase 7.1
+
+--------------------------------------------------------------------------------
+ DECODER / FRAMING, CONFIG, API   (10 files, 8,276 lines)
+--------------------------------------------------------------------------------
+  3788  [PART] ixheaacd_api.c                         decoder/engine.rs + typed config (deliberately not the C state machine, D2)
+  1192  [DONE] ixheaacd_headerdecode.c                syntax/{adts,asc,pce,adif,latm}.rs, all wired into Decoder::decode_frame
+   715  [N/A] ixheaacd_create.c                      C handle/scratch allocation -- Rust constructors
+   694  [PART] ixheaacd_init_config.c                 syntax/asc.rs -- AAC/SBR/PS config only, no USAC/MPS config
+   582  [N/A] ixheaacd_initfuncs.c                   C init plumbing -- Rust constructors
+   328  [DONE] ixheaacd_bitbuffer.c                   bitstream/{reader,writer}.rs
+   320  [DONE] ixheaacd_latmdemux.c                   syntax/latm.rs + Decoder::decode_frame auto-detects LOAS sync and unwraps it -- Phase 0.5
+   236  [PART] ixheaacd_aacpluscheck.c                decoder/engine.rs SBR presence detection
+   230  [DONE] ixheaacd_adts_crc_check.c              bitstream/crc.rs
+   191  [N/A] ixheaacd_common_initfuncs.c            C init plumbing -- Rust constructors
+
+--------------------------------------------------------------------------------
+ DECODER / DSP   (7 files, 9,720 lines)
+--------------------------------------------------------------------------------
+  3449  [DONE] ixheaacd_aac_imdct.c                   dsp/imdct.rs (quarter-length FFT)
+  2672  [DONE] ixheaacd_fft.c                         dsp/fft.rs (+ dsp/simd.rs kernels)
+  1587  [N/A] ixheaacd_fft_ifft_32x32.c              fixed-point FFT twin (R2)
+  1129  [DONE] ixheaacd_qmf_dec.c                     dsp/qmf.rs
+   654  [DONE] ixheaacd_imdct.c                       dsp/imdct.rs
+   117  [N/A] ixheaacd_dsp_fft32x32s.c               fixed-point FFT twin (R2)
+   112  [DONE] ixheaacd_Windowing.c                   dsp/window.rs
+
+--------------------------------------------------------------------------------
+ DECODER / SBR + eSBR   (17 files, 20,932 lines)
+--------------------------------------------------------------------------------
+  3727  [PART] ixheaacd_sbr_rom.c                     tables/sbr.rs -- v1 tables only
+  1962  [DONE] ixheaacd_env_extr.c                    decoder/sbr/{mod,data,header,grid}.rs
+  1899  [DONE] ixheaacd_env_calc.c                    decoder/sbr/hf.rs::adjust
+  1606  [TODO] ixheaacd_hbe_trans.c                   eSBR harmonic transposer, time domain -- Phase 5.1
+  1546  [DONE] ixheaacd_sbr_dec.c                     decoder/sbr/mod.rs
+  1359  [PART] ixheaacd_sbrdec_lpfuncs.c              decoder/sbr/mod.rs -- float subset
+  1337  [DONE] ixheaacd_sbrdecoder.c                  decoder/sbr/mod.rs
+  1278  [DONE] ixheaacd_sbrdec_initfuncs.c            decoder/sbr/header.rs
+  1258  [DONE] ixheaacd_lpp_tran.c                    decoder/sbr/hf.rs::generate (LPP transposer)
+  1093  [TODO] ixheaacd_esbr_envcal.c                 eSBR envelope calc -- Phase 5.4
+   941  [TODO] ixheaacd_hbe_dft_trans.c               eSBR harmonic transposer, DFT -- Phase 5.2
+   923  [DONE] ixheaacd_env_dec.c                     decoder/sbr/data.rs (dequantise, delta decode)
+   713  [DONE] ixheaacd_freq_sca.c                    decoder/sbr/header.rs::BandLayout::derive
+   616  [TODO] ixheaacd_pvc_rom.c                     eSBR PVC tables -- Phase 5.3
+   338  [TODO] ixheaacd_esbr_polyphase.c              eSBR polyphase -- Phase 5.4
+   239  [TODO] ixheaacd_pred_vec_block.c              eSBR PVC -- Phase 5.3
+    97  [DONE] ixheaacd_sbr_crc.c                     decoder/sbr/crc.rs ports the CRC-10 check, wired into SbrDecoder::decode_extension (rejects a payload on mismatch) -- Phase 5.5
+
+--------------------------------------------------------------------------------
+ DECODER / PARAMETRIC STEREO   (5 files, 2,964 lines)
+--------------------------------------------------------------------------------
+  1224  [DONE] ixheaacd_ps_dec_flt.c                  decoder/ps/mod.rs
+   991  [N/A] ixheaacd_ps_dec.c                      fixed-point twin of ps_dec_flt.c (R2)
+   285  [DONE] ixheaacd_hybrid.c                      decoder/ps/hybrid.rs
+   283  [DONE] ixheaacd_ps_bitdec.c                   decoder/ps/data.rs
+   181  [TODO] ixheaacd_thumb_ps_dec.c                low-power PS variant (optional)
+
+--------------------------------------------------------------------------------
+ DECODER / USAC   (16 files, 10,215 lines)
+--------------------------------------------------------------------------------
+  2154  [DONE] ixheaacd_arith_dec.c                   decoder/usac/arith.rs + tables/usac_arith.rs
+  1227  [PART] ixheaacd_avq_rom.c                     tables/usac_avq.rs -- wired into tables/mod.rs (Phase 0.3 done); usac_acelp.rs::INTERPOL_FILT extracted too
+  1069  [TODO] ixheaacd_ext_ch_ele.c                  USAC complex prediction stereo -- Phase 2.3
+   828  [TODO] ixheaacd_lpc.c                         LPD superframe top level + bass post filter -- Phase 1.8
+   685  [DONE] ixheaacd_acelp_decode.c                decoder/usac/acelp.rs -- real adaptive+algebraic codebooks, gains, post-processing (Phase 1.3/1.4/1.5 done)
+   642  [TODO] ixheaacd_usac_ec.c                     USAC error concealment -- Phase 7.1
+   606  [TODO] ixheaacd_process.c                     usac_process + eSBR parse -- Phase 2.1/2.2
+   594  [DONE] ixheaacd_acelp_bitparse.c              decoder/usac/acelp.rs::{SubframeParams,AcelpFrame}::parse (Phase 1.6 done)
+   466  [PART] ixheaacd_spectrum_dec.c                decoder/usac/fd.rs -- own framing, not ISO FD channel stream (Phase 2.2)
+   453  [PART] ixheaacd_tcx_fwd_alcnx.c               decoder/usac/tcx.rs -- noise_shape/low_frequency_deemphasis ported; the asymmetric-overlap MDCT and mode_prev/exc_prev state machine in this file are not
+   312  [PART] ixheaacd_avq_dec.c                     decoder/usac/avq.rs ports rotated_gosset_mtx_dec for qn<=4 (base lattice, no Voronoi ext.), verified structurally against every ABSOLUTE_LEADER_TAB row; qn>4 Voronoi extension and the FAC/LSF-refinement callers are still open
+   279  [DONE] ixheaacd_lpc_dec.c                     decoder/usac/lsf.rs + tables/usac_lsf*.rs
+   255  [PART] ixheaacd_tcx_fwd_mdct.c                decoder/usac/tcx.rs -- weight_lpc/spectral_envelope_gains ported (ixheaacd_lpc_coeff_wt_apply/ixheaacd_lpc_to_td); this file also has ixheaacd_lsp_to_lp_conversion, already covered by tables/usac_lsf.rs::lsp_to_lpc; ixheaacd_lpc_coef_gen/ixheaacd_interpolation_lsp_params (per-subframe LPC interpolation) covered by decoder/usac/mod.rs::interpolate_lpc
+   243  [TODO] ixheaacd_acelp_mdct.c                  ACELP-side MDCT for FAC -- Phase 1.7
+   203  [DONE] ixheaacd_acelp_tools.c                 decoder/usac/acelp.rs -- preemph/deemph/residual/synthesis/pitch_sharpening (Phase 1.2 done; rand_gen still unported, needed only for error concealment)
+   199  [TODO] ixheaacd_fwd_alias_cnx.c               FAC across mode switches -- Phase 1.7
+
+--------------------------------------------------------------------------------
+ DECODER / uniDRC   (24 files, 17,868 lines)
+--------------------------------------------------------------------------------
+  2501  [PART] impd_drc_static_payload.c              decoder/drc/{loudness_info,channel_layout,downmix_instructions,gain_modifiers,gain_set_params}.rs port impd_parse_loudness_info/impd_parse_loudness_measure/impd_dec_method_value/impd_parse_ch_layout/impd_parse_dwnmix_instructions/impd_parse_gain_set_params_characteristics/impd_dec_gain_modifiers/impd_parse_gain_set_params; the surrounding uniDrcConfig() (DRC sets, EQ) in this same file is still TODO -- Phase 6.1
+  1559  [TODO] impd_drc_selection_process_drcset_selection.c MPEG-D uniDRC decode -- Phase 6
+  1458  [TODO] impd_drc_dynamic_payload.c             MPEG-D uniDRC decode -- Phase 6
+  1347  [TODO] impd_drc_eq.c                          MPEG-D uniDRC decode -- Phase 6
+  1144  [TODO] impd_drc_rom.c                         MPEG-D uniDRC decode -- Phase 6
+  1119  [TODO] impd_drc_selection_process.c           MPEG-D uniDRC decode -- Phase 6
+  1109  [TODO] impd_drc_parametric_dec.c              MPEG-D uniDRC decode -- Phase 6
+  1106  [PART] ixheaacd_drc_freq_dec.c                decoder/drc/mod.rs -- legacy dynamic_range_info() only
+   906  [TODO] impd_drc_loudness_control.c            MPEG-D uniDRC decode -- Phase 6
+   790  [TODO] impd_drc_gain_dec.c                    MPEG-D uniDRC decode -- Phase 6
+   618  [TODO] impd_drc_api.c                         MPEG-D uniDRC decode -- Phase 6
+   588  [TODO] impd_drc_init.c                        MPEG-D uniDRC decode -- Phase 6
+   537  [TODO] impd_drc_selection_process_init.c      MPEG-D uniDRC decode -- Phase 6
+   450  [TODO] impd_drc_gain_decoder.c                MPEG-D uniDRC decode -- Phase 6
+   431  [TODO] impd_drc_filter_bank.c                 MPEG-D uniDRC decode -- Phase 6
+   380  [TODO] impd_drc_main_td_process.c             MPEG-D uniDRC decode -- Phase 6
+   368  [TODO] impd_drc_dec.c                         MPEG-D uniDRC decode -- Phase 6
+   331  [TODO] impd_drc_process.c                     MPEG-D uniDRC decode -- Phase 6
+   308  [TODO] impd_drc_shape_filter.c                MPEG-D uniDRC decode -- Phase 6
+   218  [N/A] impd_drc_bitbuffer.c                   C bit buffer -- bitstream/reader.rs covers it
+   181  [TODO] impd_drc_peak_limiter.c                uniDRC peak limiter -- Phase 6.5
+   166  [TODO] impd_drc_multiband.c                   MPEG-D uniDRC decode -- Phase 6
+   161  [TODO] impd_drc_interface_decoder.c           MPEG-D uniDRC decode -- Phase 6
+    92  [TODO] impd_drc_extr_delta_coded_info.c       MPEG-D uniDRC decode -- Phase 6
+
+--------------------------------------------------------------------------------
+ DECODER / MPEG SURROUND   (39 files, 35,291 lines)
+--------------------------------------------------------------------------------
+  8286  [TODO] ixheaacd_mps_rom.c                     MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  2828  [TODO] ixheaacd_mps_bitdec.c                  MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  2139  [TODO] ixheaacd_mps_dec.c                     MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  1888  [TODO] ixheaacd_mps_mdct_2_qmf.c              MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  1501  [TODO] ixheaacd_mps_parse.c                   MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  1474  [TODO] ixheaacd_mps_temp_process.c            MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  1416  [TODO] ixheaacd_mps_initfuncs.c               MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  1395  [TODO] ixheaacd_mps_pre_mix.c                 MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  1232  [TODO] ixheaacd_mps_hybrid_filt.c             MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  1180  [TODO] ixheaacd_mps_polyphase.c               MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  1070  [TODO] ixheaacd_mps_decorr.c                  MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+  1070  [TODO] ixheaacd_mps_res_block.c               MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   942  [TODO] ixheaacd_mps_calc_m1m2_common.c        MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   897  [TODO] ixheaacd_mps_calc_m1m2_tree_727x.c     MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   726  [TODO] ixheaacd_mps_smoothing.c               MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   643  [TODO] ixheaacd_mps_calc_m1m2_tree_52xx.c     MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   594  [TODO] ixheaacd_mps_reshape_bb_env.c          MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   529  [TODO] ixheaacd_mps_calc_m1m2_tree_515x.c     MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   498  [TODO] ixheaacd_mps_apply_m2.c                MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   436  [TODO] ixheaacd_mps_tonality.c                MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   433  [TODO] ixheaacd_mps_blind.c                   MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   393  [TODO] ixheaacd_mps_res_channel.c             MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   391  [TODO] ixheaacd_mps_poly_filt.c               MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   380  [TODO] ixheaacd_mps_process.c                 MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   338  [TODO] ixheaacd_ld_mps_config.c               MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   330  [TODO] ixheaacd_mps_calc_m1m2_tree_51sx.c     MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   281  [TODO] ixheaacd_mps_m1m2_common.c             MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   261  [TODO] ixheaacd_mps_apply_m1.c                MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   240  [TODO] ixheaacd_mps_calc_m1m2_tree_757x.c     MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   233  [TODO] ixheaacd_mps_res_longblock.c           MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   212  [TODO] ixheaacd_ld_mps_dec.c                  MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   211  [TODO] ixheaacd_mps_temp_reshape.c            MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   193  [TODO] ixheaacd_mps_calc_m1m2_emm.c           MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   175  [TODO] ixheaacd_mps_res_pns_js_thumb.c        MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   152  [TODO] ixheaacd_mps_res_tns.c                 MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+   112  [TODO] ixheaacd_mps_apply_common.c            MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+    97  [TODO] ixheaacd_mps_res_channel_info.c        MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+    61  [TODO] ixheaacd_mps_get_index.c               MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+    54  [TODO] ixheaacd_mps_res_pulsedata.c           MPEG Surround -- Phase 9 (decoder/mps/mod.rs is FAKE today)
+
+--------------------------------------------------------------------------------
+ ENCODER / AAC CORE   (33 files, 17,356 lines)
+--------------------------------------------------------------------------------
+  3964  [PART] ixheaace_rom.c                         tables/* -- AAC-LC subset
+  1709  [PART] ixheaace_fd_qc_adjthr.c                encoder/aac/rate.rs -- single rate strategy
+  1269  [PART] ixheaace_common_rom.c                  tables/* -- AAC-LC subset
+   991  [DONE] ixheaace_adjust_threshold.c            encoder/aac/psycho.rs + rate.rs
+   948  [DONE] ixheaace_bits_count.c                  encoder/aac/huffman.rs::tuple_cost
+   828  [DONE] ixheaace_write_bitstream.c             encoder/aac/bitstream.rs
+   782  [DONE] ixheaace_sf_estimation.c               encoder/aac/rate.rs (warm-started search)
+   679  [DONE] ixheaace_fd_quant.c                    encoder/aac/quant.rs
+   671  [DONE] ixheaace_psy_mod.c                     encoder/aac/psycho.rs
+   598  [DONE] ixheaace_dynamic_bits.c                encoder/aac/huffman.rs + bitstream.rs
+   523  [TODO] ixheaace_cplx_pred.c                   complex prediction encode -- Phase 2.3 (encoder half)
+   518  [PART] ixheaace_qc_util.c                     encoder/aac/rate.rs
+   432  [DONE] ixheaace_psy_configuration.c           encoder/aac/psycho.rs
+   397  [DONE] ixheaace_tns.c                         encoder/aac/tns.rs
+   280  [N/A] ixheaace_qc_main_hp.c                  high-performance fixed-point QC twin (R2)
+   266  [DONE] ixheaace_block_switch.c                encoder/aac/block_switch.rs
+   256  [TODO] ixheaace_stereo_preproc.c              stereo pre-processing -- Phase 2.9 backlog
+   245  [N/A] ixheaace_tns_hp.c                      high-performance fixed-point TNS twin (R2)
+   240  [DONE] ixheaace_tns_init.c                    encoder/aac/tns.rs
+   237  [DONE] ixheaace_enc_main.c                    encoder/engine.rs
+   207  [DONE] ixheaace_static_bits.c                 encoder/aac/bitstream.rs
+   191  [DONE] ixheaace_group_data.c                  encoder/engine.rs (short-window grouping)
+   178  [PART] ixheaace_nf.c                          encoder/usac/fd.rs -- USAC noise filling, simplified (documented)
+   164  [PART] ixheaace_fd_qc_util.c                  encoder/aac/rate.rs
+   148  [DONE] ixheaace_tns_params.c                  tables/tns.rs
+   137  [DONE] ixheaace_ms_stereo.c                   encoder/engine.rs (M/S decision)
+   127  [DONE] ixheaace_fd_enc.c                      encoder/engine.rs
+    89  [DONE] ixheaace_calc_ms_band_energy.c         encoder/engine.rs
+    65  [DONE] ixheaace_basic_ops.c                   dsp/math.rs
+    60  [DONE] ixheaace_psy_utils.c                   encoder/aac/psycho.rs
+    58  [DONE] ixheaace_psy_utils_spreading.c         encoder/aac/psycho.rs
+    54  [DONE] ixheaace_quant.c                       encoder/aac/quant.rs
+    45  [DONE] ixheaace_huffman_rom.c                 tables/huffman.rs
+
+--------------------------------------------------------------------------------
+ ENCODER / FRAMING, CONFIG, API   (8 files, 6,099 lines)
+--------------------------------------------------------------------------------
+  3921  [PART] ixheaace_api.c                         encoder/engine.rs + EncoderConfig (not the C state machine, D2)
+   701  [PART] ixheaace_asc_write.c                   syntax/asc.rs -- AAC subset
+   518  [DONE] ixheaace_enc_init.c                    Encoder::new
+   345  [DONE] ixheaace_write_adts_adif.c             encoder/aac/bitstream.rs (ADTS) + encoder::engine::OutputFormat::Adif (ADIF, new)
+   214  [DONE] ixheaace_bitbuffer.c                   bitstream/writer.rs
+   211  [PART] ixheaace_channel_map.c                 encoder/aac/bitstream.rs::write_multichannel_elements
+    96  [N/A] ixheaace_bitbuffer_hp.c                fixed-point bit buffer twin (R2)
+    93  [N/A] ixheaace_interface.c                   C plumbing
+
+--------------------------------------------------------------------------------
+ ENCODER / DSP   (6 files, 3,973 lines)
+--------------------------------------------------------------------------------
+  2485  [DONE] ixheaace_fft.c                         dsp/fft.rs
+   523  [DONE] ixheaace_resampler.c                   dsp/resampler.rs
+   489  [TODO] ixheaace_mdct_480.c                    480/512 transform for LD/ELD + 960 frames -- Phase 8.1
+   215  [DONE] ixheaace_fd_mdct.c                     dsp/mdct.rs
+   175  [DONE] ixheaace_radix2_fft.c                  dsp/fft.rs
+    86  [DONE] ixheaace_resampler_init.c              dsp/resampler.rs
+
+--------------------------------------------------------------------------------
+ ENCODER / SBR + eSBR   (28 files, 20,032 lines)
+--------------------------------------------------------------------------------
+  2948  [TODO] ixheaace_sbr_env_est.c                 encoder/sbr/mod.rs now refuses (Err(Unimplemented)) rather than faking -- Phase 4.2
+  1939  [TODO] ixheaace_sbr_rom.c                     SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+  1679  [TODO] ixheaace_sbr_hbe_fft_ifft_32x32.c      eSBR encode transposer -- Phase 5 / 4
+  1589  [TODO] ixheaace_sbr_hbe_trans.c               eSBR encode transposer -- Phase 5 / 4
+  1399  [TODO] ixheaace_sbr_write_bitstream.c         SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+  1356  [TODO] ixheaace_sbr_qmf_enc.c                 SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+  1151  [TODO] ixheaace_sbr_frame_info_gen.c          SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+  1097  [TODO] ixheaace_sbr_main.c                    SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+  1007  [TODO] ixheaace_sbr_hbe_dft_trans.c           eSBR encode transposer -- Phase 5 / 4
+   793  [TODO] iusace_esbr_inter_tes.c                eSBR inter-TES -- Phase 5.4
+   747  [TODO] ixheaace_sbr_missing_harmonics_det.c   SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   692  [TODO] ixheaace_sbr_freq_scaling.c            SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   426  [TODO] iusace_esbr_pvc.c                      eSBR PVC encode -- Phase 5.3
+   333  [TODO] ixheaace_sbr_tran_det_hp.c             SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   329  [TODO] ixheaace_sbr_hbe_polyphase.c           eSBR encode transposer -- Phase 5 / 4
+   329  [TODO] ixheaace_sbr_ton_corr.c                SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   323  [TODO] ixheaace_sbr_noise_floor_est.c         SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   279  [TODO] ixheaace_sbr_tran_det.c                SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   251  [TODO] iusace_esbr_pvc_rom.c                  eSBR PVC tables -- Phase 5.3
+   248  [TODO] ixheaace_sbr_inv_filtering_estimation.c SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   243  [TODO] ixheaace_sbr_code_envelope_lp.c        SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   192  [TODO] ixheaace_sbr_code_envelope.c           SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   190  [TODO] ixheaace_sbr_ton_corr_hp.c             SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   169  [TODO] ixheaace_sbr_env_est_init.c            SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+   126  [TODO] ixheaace_sbr_crc.c                     SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+    87  [TODO] ixheaace_sbr_qmf_enc_init.c            SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+    78  [TODO] ixheaace_sbr_misc.c                    SBR encode -- Phase 4 (encoder/sbr/mod.rs is FAKE today)
+    32  [TODO] iusace_esbr_rom.c                      eSBR tables -- Phase 5
+
+--------------------------------------------------------------------------------
+ ENCODER / PARAMETRIC STEREO   (5 files, 1,628 lines)
+--------------------------------------------------------------------------------
+   671  [TODO] ixheaace_ps_enc.c                      encoder/ps/mod.rs now refuses (Err(Unimplemented)) rather than faking -- Phase 4.6
+   370  [TODO] ixheaace_hybrid.c                      encoder-side hybrid filterbank -- Phase 4.6
+   312  [TODO] ixheaace_ps_bitenc.c                   PS payload writer -- Phase 4.6
+   210  [TODO] ixheaace_ps_enc_init.c                 Phase 4.6
+    65  [TODO] ixheaace_hybrid_init.c                 Phase 4.6
+
+--------------------------------------------------------------------------------
+ ENCODER / USAC   (29 files, 31,254 lines)
+--------------------------------------------------------------------------------
+ 15083  [PART] iusace_rom.c                           tables/usac_{arith,lsf,lsf_dico}.rs -- 15,083 C lines, small fraction ported (R3)
+  1586  [DONE] iusace_fft.c                           dsp/fft.rs
+  1518  [TODO] ixheaace_signal_classifier_rom.c       classifier tables -- Phase 3.1
+  1472  [PART] iusace_enc_main.c                      encoder/usac/fd.rs -- FD half only
+  1082  [TODO] iusace_acelp_tools.c                   encoder ACELP tools -- Phase 3.2
+  1076  [FAKE] ixheaace_signal_classifier.c           usac/mod.rs::classify_frame is a heuristic stand-in -- Phase 3.1
+   850  [TODO] iusace_lpd_enc.c                       LPD mode decision -- Phase 3.5
+   844  [TODO] iusace_tcx_enc.c                       TCX encode -- Phase 3.4
+   712  [TODO] iusace_write_bitstream.c               ISO USAC framing (VUSC container today, D3) -- Phase 2.5
+   674  [PART] iusace_avq_rom.c                       tables/usac_avq.rs (orphan -- Phase 0.3)
+   593  [TODO] iusace_lpd_utils.c                     LPD helpers -- Phase 3.5
+   537  [TODO] iusace_enc_fac.c                       FAC generation -- Phase 3.4
+   536  [DONE] iusace_tns_usac.c                      encoder/usac/tns.rs
+   510  [PART] iusace_psy_utils.c                     encoder/usac/fd.rs
+   439  [TODO] iusace_acelp_enc.c                     ACELP analysis-by-synthesis -- Phase 3.2/3.3
+   433  [DONE] iusace_arith_enc.c                     encoder/usac/arith.rs
+   417  [TODO] iusace_lpd_rom.c                       LPD tables -- Phase 3.5
+   372  [TODO] iusace_lpc_avq.c                       LSF stage-2 AVQ quantisation -- Phase 3.6
+   343  [TODO] iusace_avq_enc.c                       AVQ lattice search + index coding -- Phase 3.6
+   332  [TODO] iusace_fd_fac.c                        FD-side FAC -- Phase 3.4
+   282  [PART] iusace_block_switch.c                  encoder/aac/block_switch.rs reused
+   275  [PART] iusace_psy_mod.c                       encoder/usac/fd.rs -- simplified
+   218  [PART] iusace_psy_rom.c                       tables/*
+   216  [DONE] iusace_lpc.c                           encoder/usac/lsf.rs
+   213  [TODO] iusace_acelp_rom.c                     ACELP tables -- Phase 3.2
+   186  [TODO] iusace_tcx_mdct.c                      TCX MDCT -- Phase 3.4
+   181  [PART] iusace_windowing.c                     dsp/window.rs
+   142  [DONE] iusace_ms.c                            encoder/usac/fd.rs (M/S)
+   132  [DONE] iusace_bitbuffer.c                     bitstream/writer.rs
+
+--------------------------------------------------------------------------------
+ ENCODER / uniDRC   (9 files, 8,355 lines)
+--------------------------------------------------------------------------------
+  3374  [TODO] impd_drc_mux.c                         MPEG-D uniDRC encode -- Phase 6.7
+  1439  [TODO] impd_drc_uni_drc_eq.c                  MPEG-D uniDRC encode -- Phase 6.7
+  1024  [TODO] impd_drc_gain_enc.c                    MPEG-D uniDRC encode -- Phase 6.7
+   844  [TODO] impd_drc_api.c                         MPEG-D uniDRC encode -- Phase 6.7
+   537  [TODO] impd_drc_gain_calculator.c             MPEG-D uniDRC encode -- Phase 6.7
+   400  [DONE] ixheaace_loudness_measurement.c        encoder/drc/mod.rs (BS.1770 K-weighting + gating)
+   339  [TODO] impd_drc_enc.c                         MPEG-D uniDRC encode -- Phase 6.7
+   214  [TODO] impd_drc_tables.c                      MPEG-D uniDRC encode -- Phase 6.7
+   184  [TODO] impd_drc_uni_drc_filter_bank.c         MPEG-D uniDRC encode -- Phase 6.7
+
+--------------------------------------------------------------------------------
+ ENCODER / MPEG SURROUND   (19 files, 10,409 lines)
+--------------------------------------------------------------------------------
+  1914  [TODO] ixheaace_mps_nlc_enc.c                 MPEG Surround encode -- Phase 9.8
+  1391  [TODO] ixheaace_mps_enc.c                     MPEG Surround encode -- Phase 9.8
+  1385  [TODO] ixheaace_mps_huff_tab.c                MPEG Surround encode -- Phase 9.8
+  1031  [TODO] ixheaace_mps_bitstream.c               MPEG Surround encode -- Phase 9.8
+  1023  [TODO] ixheaace_mps_polyphase.c               MPEG Surround encode -- Phase 9.8
+  1000  [TODO] ixheaace_mps_hybrid_filter.c           MPEG Surround encode -- Phase 9.8
+   496  [TODO] ixheaace_mps_tools_rom.c               MPEG Surround encode -- Phase 9.8
+   344  [TODO] ixheaace_mps_param_extract.c           MPEG Surround encode -- Phase 9.8
+   301  [TODO] ixheaace_mps_frame_windowing.c         MPEG Surround encode -- Phase 9.8
+   254  [TODO] ixheaace_mps_rom.c                     MPEG Surround encode -- Phase 9.8
+   215  [TODO] ixheaace_mps_dmx_tdom_enh.c            MPEG Surround encode -- Phase 9.8
+   211  [TODO] ixheaace_mps_dct.c                     MPEG Surround encode -- Phase 9.8
+   188  [TODO] ixheaace_mps_tree.c                    MPEG Surround encode -- Phase 9.8
+   164  [TODO] ixheaace_mps_qmf.c                     MPEG Surround encode -- Phase 9.8
+   148  [TODO] ixheaace_mps_onset_detect.c            MPEG Surround encode -- Phase 9.8
+   129  [TODO] ixheaace_mps_delay.c                   MPEG Surround encode -- Phase 9.8
+    80  [TODO] ixheaace_mps_vector_functions.c        MPEG Surround encode -- Phase 9.8
+    74  [TODO] ixheaace_mps_static_gain.c             MPEG Surround encode -- Phase 9.8
+    61  [TODO] ixheaace_mps_filter.c                  MPEG Surround encode -- Phase 9.8
+
+--------------------------------------------------------------------------------
+ COMMON   (3 files, 7,097 lines)
+--------------------------------------------------------------------------------
+  4678  [TODO] ixheaac_esbr_rom.c                     eSBR ROM -- Phase 5
+  1210  [N/A] ixheaac_fft_ifft_32x32_rom.c           fixed-point FFT twiddles (R2)
+  1209  [TODO] ixheaac_esbr_fft.c                     eSBR FFT sizes -- Phase 5.2
+
+--------------------------------------------------------------------------------
+ TALLY
+--------------------------------------------------------------------------------
+   DONE    80 files      54,951 C lines
+   PART    33 files      53,030 C lines
+   SKIP     1 files         531 C lines
+   FAKE     1 files       1,076 C lines
+   TODO   156 files     117,702 C lines
+   N/A     12 files       6,325 C lines
+   TOTAL  283 files     233,615 C lines
+
+================================================================================

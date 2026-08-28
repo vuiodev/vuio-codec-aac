@@ -1,0 +1,433 @@
+# High-Performance Bit-Exact Rust 2024 Architecture Plan: Complete Rewrite of libxaac
+
+## Executive Summary
+
+`libxaac` is a comprehensive MPEG audio codec suite authored by Ittiam Systems and released under the Apache 2.0 license as part of the Android Open Source Project (AOSP). It implements the complete MPEG AAC/USAC/DRC family:
+- **AAC-LC** (Low Complexity)
+- **HE-AAC v1 / v2** (SBR - Spectral Band Replication & PS - Parametric Stereo)
+- **AAC-LD / AAC-ELD / AAC-ELDv2** (Low Delay and Enhanced Low Delay modes)
+- **MPEG-D USAC** (Unified Speech and Audio Coding: ACELP speech core, TCX transform core, FD mode, AVQ, eSBR, PVC)
+- **MPEG-D DRC** (Dynamic Range Control, Loudness Normalization, EQ, Ducking, Peak Limiter)
+- **MPEG Surround (MPS)** (Multi-channel spatial audio: 5.1, 7.1, binaural)
+
+This plan outlines the complete rewrite of `libxaac` into a modern, 100% idiomatic, memory-safe **Rust 2024 Edition** crate named `xaac` (with library and CLI tools `aacdec` and `aacenc`).
+
+### Core Directives:
+1. **100% Proper Rust (2024 Edition)**: Safe abstractions, expressive domain types, zero raw pointer casting, structured error hierarchies (`Result<T, E>`), and zero-copy streaming readers/writers.
+2. **Latest Best-in-Class Rust Crates**: `thiserror 2.0`, `clap 4.5`, `rayon 1.10`, `aligned-vec 0.6`, `bytes 1.7`, `bitflags 2.6`, `hound 3.5`, `tracing 0.1`, and `criterion 0.5`.
+3. **100% Feature & Tool Completeness**: Exhaustive implementation of every single tool, profile, mode, syntax, and transform present in `c/libxaac`.
+4. **Bit-Perfect Correctness**: Output must be **bit-for-bit identical** to the reference C `libxaac` by preserving exact fixed-point mathematical semantics, saturation behaviors, lookup tables, and framing layouts.
+5. **Extreme Performance (Beating C on Speed)**:
+   - **SIMD**: Auto-vectorization + explicit AVX2, AVX-512, FMA (x86_64) and NEON (ARM64 / Apple Silicon).
+   - **Assembly**: Hand-tuned `core::arch::asm!` kernels for inner DSP loops (saturating Q31/Q15 math, butterfly FFTs, QMF polyphase).
+   - **Multicore / Rayon**: Multi-channel concurrent DSP, parallel frame/chunk batch processing, and parallel psychoacoustic subband analysis.
+   - **Zero-Allocation Steady-State**: Pre-allocated, 64-byte cache-line aligned scratch buffers with zero heap allocation in frame loops.
+
+---
+
+## 100% Feature & Tool Coverage Matrix
+
+Every tool, profile, and algorithmic module in `c/libxaac` is mapped directly to our Rust crate architecture:
+
+| Subsystem | Tool / Module in `libxaac` | Rust Module Target | Coverage & Technical Scope |
+| :--- | :--- | :--- | :--- |
+| **Containers & Syntax** | RAW, ADTS, ADIF, LATM / LOAS | `syntax::{raw, adts, adif, latm}` | Frame sync, CRC-16 check, `AudioMuxElement`, `StreamMuxConfig` |
+| **Config & Metadata** | `AudioSpecificConfig`, PCE, DSE, FIL | `syntax::{asc, pce}` | All AOTs (1..45), custom sample rates, custom multichannel channel routing (0..13) |
+| **Core Elements** | SCE, CPE, CCE, LFE | `decoder::aac::channel` | Single channel, channel pair, channel coupling, low-frequency elements |
+| **Huffman & Entropy** | Codebooks 1..11, ESC, HCR, RVLC | `decoder::aac::huffman` | Spectral Huffman decoding, Huffman Codebook Reordering, Reversible Variable Length Coding |
+| **Quantization** | Scalefactors, Inverse Quantization | `decoder::aac::dequant` | $x = \text{sign}(q) \cdot \vert q\vert^{4/3} \cdot 2^{(\text{sf}-100)/4}$, all 12 sample rate band tables |
+| **Joint Stereo & Tools** | M/S, Intensity Stereo, PNS, Pulse | `decoder::aac::{stereo, pns, pulse}` | Mid/Side, Intensity stereo, Perceptual Noise Substitution, Pulse data tool |
+| **TNS & Predictors** | Temporal Noise Shaping, LTP | `decoder::aac::{tns, ltp}` | Spectral LPC lattice filtering (orders 1..12), Long Term Prediction for LD |
+| **Transforms & Windowing**| MDCT / IMDCT (1024, 960, 512, 480, 128, 120) | `dsp::{mdct, window}` | Sine, KBD ($\alpha$), and Low-Delay windows, overlap-add delay lines |
+| **Error Concealment** | Frame Loss & Error Recovery | `decoder::aac::concealment` | Energy extrapolation, spectral fade-out/fade-in, state history recovery |
+| **SBR / eSBR** | QMF 32/64, HF Patching, Envelope, HBE, PVC | `decoder::sbr::*` | HQ complex & LP real QMF, envelope grid (FIXFIX..VARVAR), inverse filtering, HBE, PVC, Inter-TES |
+| **Parametric Stereo** | PS Bitdec, Hybrid Filterbank, Decorrelator | `decoder::ps::*` | IID, ICC, IPD, OPD, all-pass fractional delay decorrelation, spatial reconstruction matrix |
+| **MPEG Surround (MPS)** | Trees (5.1, 7.1, Binaural), OTT, TTT, M1/M2 | `decoder::mps::*` | Spatial audio decoding, CLD, ICC, CPC, IPD, OPD, temporal envelope shaping, MDCT $\leftrightarrow$ QMF |
+| **MPEG-D USAC** | ACELP, TCX, FD mode, LPD, AVQ, Arith | `decoder::usac::*` | Speech/Music classification, ACELP speech core, TCX 20/40/80 ms, AVQ, Forward Aliasing Cancellation (FAC) |
+| **MPEG-D DRC** | UniDRC, Loudness (BS.1770), Multi-band, EQ | `decoder::drc::*` | Loudness normalization, spline gain interpolation, dynamic EQ filterbank, peak limiter |
+| **Core AAC Encoder** | Block switching, Psychoacoustics, Quantizer | `encoder::aac::*` | Transient detection, Bark band masking, two-loop rate-distortion quantizer, bit reservoir |
+| **SBR / PS / USAC Enc** | SBR / PS / USAC / DRC Parameter Extraction | `encoder::{sbr, ps, usac, drc}` | QMF analysis, tonality, missing harmonics, BS.1770 measurement, ACELP/TCX speech encoding |
+| **CLI & I/O** | `aacdec` and `aacenc` command-line tools | `bin::{aacdec, aacenc}` | Multithreaded WAV I/O (`hound`), argument parsing (`clap 4.5`), batch encoding/decoding |
+
+---
+
+## Modern Dependencies & `Cargo.toml` Specification
+
+```toml
+[package]
+name = "xaac"
+version = "0.1.0"
+edition = "2024"
+authors = ["Antigravity & Contributors"]
+license = "Apache-2.0"
+description = "High-performance, bit-exact, pure Rust 2024 implementation of the MPEG AAC, HE-AAC v1/v2, AAC-ELD, USAC, and DRC audio codec family."
+readme = "README.md"
+repository = "https://github.com/alex/xaac"
+keywords = ["audio", "aac", "codec", "dsp", "usac"]
+categories = ["multimedia::audio", "encoding", "algorithms"]
+
+[features]
+default = ["decoder", "encoder", "sbr", "ps", "simd", "rayon", "std"]
+std = []
+decoder = []
+encoder = []
+sbr = []
+ps = []
+mps = []
+usac = []
+drc = []
+simd = []
+rayon = ["dep:rayon"]
+
+[dependencies]
+# Error handling - latest major release
+thiserror = "2.0"
+
+# High-performance memory and alignment for SIMD / Cache-line alignment (64-byte aligned)
+aligned-vec = "0.6"
+bytes = "1.7"
+byteorder = "1.5"
+
+# Bitflags for syntax headers & channel configurations
+bitflags = "2.6"
+
+# Multithreaded parallel DSP processing (multi-channel, batch chunking, psychoacoustics)
+rayon = { version = "1.10", optional = true }
+
+# Structured diagnostics & profiling
+tracing = { version = "0.1", default-features = false }
+
+# CLI dependencies (only built for bin targets)
+clap = { version = "4.5", features = ["derive", "cargo", "wrap_help"], optional = true }
+hound = { version = "3.5", optional = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], optional = true }
+
+[[bin]]
+name = "aacdec"
+path = "src/bin/aacdec.rs"
+required-features = ["decoder", "clap", "hound", "tracing-subscriber"]
+
+[[bin]]
+name = "aacenc"
+path = "src/bin/aacenc.rs"
+required-features = ["encoder", "clap", "hound", "tracing-subscriber"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+hound = "3.5"
+tempfile = "3.12"
+
+[[bench]]
+name = "dsp_transforms"
+harness = false
+
+[[bench]]
+name = "decode_bench"
+harness = false
+
+[[bench]]
+name = "encode_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+debug = false
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+```
+
+---
+
+## Architectural Comparison: Legacy C vs High-Performance Rust 2024
+
+```
++---------------------------------------------------------------------------------------------------------+
+|                                     C libxaac vs Rust 2024 xaac                                         |
++------------------------------------------+--------------------------------------------------------------+
+| Legacy C libxaac                         | High-Performance Rust 2024 xaac                             |
++------------------------------------------+--------------------------------------------------------------+
+| Raw void* pointers & manual alloc arrays | Safe, strongly typed structs & zero-allocation buffer pools  |
+| Negative error codes (IA_ERRORCODE)      | Strongly typed Result<T, AacError> with thiserror 2.0        |
+| Global mutable state & singletons        | Thread-safe, reentrant, instance-based API (Send + Sync)     |
+| Tangled function pointer selectors       | Static dispatch + dynamic CPU feature detection (AVX2/NEON) |
+| Platform-broken assembly (fails macOS)   | Cross-platform SIMD (AVX2/AVX-512/NEON) + inline asm!        |
+| Single-threaded execution                | Multicore Rayon 1.10 parallelism for channels & frames       |
+| Vulnerable buffer indexing               | Bounds-checked zero-cost slice iteration (&[T], &mut [T])    |
++------------------------------------------+--------------------------------------------------------------+
+```
+
+---
+
+## Bit-Perfect Guarantee Strategy
+
+To ensure sample-accurate, bit-for-bit equivalence with C `libxaac`:
+
+1. **Exact Fixed-Point Arithmetic Model**:
+   - `libxaac` uses custom Q-format fixed-point operations (Q15, Q31, Q40 accumulators, saturating additions, saturating left/right shifts, fractional multiplications `mult32x16_shl`, `mult32x32_in64`).
+   - We will implement a dedicated DSP math module `dsp::math` providing exact bit-level equivalents of every basic op:
+     - `saturate_32(x: i64) -> i32`, `saturate_16(x: i32) -> i16`
+     - `mult_32x16_shl_sat(a: i32, b: i16) -> i32`
+     - `mult_32x32_sat(a: i32, b: i32) -> i32`
+     - `mac_32x32_to_64(acc: i64, a: i32, b: i32) -> i64`
+     - Exact normalized integer division `div32_pos_normb(a, b)`
+2. **Table Bit-Exactness**:
+   - Static tables (Huffman codebooks 1-11 + ESC, scalefactor bands for all 12 sampling rates, SBR frequency tables, twiddles, window shapes Sine/KBD/LowDelay, USAC AVQ/arithmetic tables, UniDRC tables) will be directly verified against reference tables.
+3. **Automated Verification Harness**:
+   - Golden tests will run the reference C `libxaac` and Rust `xaac` on identical inputs (sine waves, white noise, speech, multi-channel audio, sweep signals, corrupted streams) and assert:
+     ```rust
+     assert_eq!(rust_pcm_samples, c_pcm_samples, "Bit-exact mismatch at sample {}", idx);
+     ```
+
+---
+
+## Extreme Optimization Strategy to Beat C on Speed
+
+### 1. Vectorization & SIMD Engine (`dsp::simd`)
+- **Multi-tiered Kernel Dispatch**:
+  - **Tier 1 (Generic Safe Rust)**: Written using iterator windows (`chunks_exact`, `zip`) with loop-unrolling hints and auto-vectorization friendly layouts.
+  - **Tier 2 (AVX2 / AVX-512 on x86_64)**: 8-way or 16-way parallel 32-bit DSP operations (`_mm256_madd_epi16`, `_mm256_adds_epi32`, `_mm512_fmadd_ps`).
+  - **Tier 3 (NEON on ARM64 / Apple Silicon)**: 4-way parallel 32-bit operations utilizing native saturating doubling multiply-high (`sqrdmulh`), saturating adds (`sqadd`), and vector fused multiply-accumulate (`fmla`).
+- **SIMD Optimized Hotspots**:
+  - **FFT Butterfly Loops**: Vectorized radix-2 and radix-4 complex butterfly passes.
+  - **IMDCT / MDCT Transforms**: Vectorized pre-twiddle, post-twiddle, and windowing overlap-add folding.
+  - **QMF Polyphase Analysis & Synthesis**: Vectorized 32/64 band FIR filter dot-products.
+  - **SBR High-Frequency Generation & Envelope Adjustment**: Vectorized spectral energy estimation, noise injection, and limiter calculations.
+  - **DRC Gain Interpolator & Limiter**: Vectorized spline interpolation and dynamic gain smoothing.
+  - **Psychoacoustic Model**: Vectorized Bark band energy aggregation, spreading function convolution, and threshold calculation.
+
+### 2. Hand-Tuned Inline Assembly (`dsp::asm`)
+- Where compiler intrinsics introduce register spills, use inline assembly (`core::arch::asm!`):
+  - ARM64: Fast dual-accumulator Q31 saturating MAC loops and unrolled QMF windowing.
+  - x86_64: Unrolled AVX2 butterfly transforms and packing/unpacking routines.
+
+### 3. Multicore Concurrency (`rayon`)
+- **Multi-Channel Parallelism**: In stereo, 5.1, and 7.1 multichannel streams, SCE (Single Channel Element), CPE (Channel Pair Element), and LFE channels run MDCT/IMDCT, psychoacoustics, and QMF filterbanks concurrently across worker threads using `rayon::join` or `par_iter()`.
+- **Frame-Level Batch Parallelism**: For bulk decoding and encoding (files / multi-frame packets), independent audio frames/chunks are processed across all available CPU cores with work-stealing queues.
+- **Parallel Rate-Distortion Search**: Scalefactor and distortion-rate optimization evaluated concurrently across scalefactor bands.
+
+### 4. Zero-Allocation Steady-State & Cache Alignment
+- No heap allocations (`malloc`/`Box::new`/`Vec::push`) occur during steady-state frame decoding or encoding.
+- The `Decoder` and `Encoder` allocate dedicated frame scratchpads and history delay lines during initialization.
+- All audio buffers and transform arrays use **64-byte alignment** (via `aligned_vec::AVec`) matching CPU cache lines and AVX-512 requirements to eliminate unaligned memory penalties.
+- Data structures use **Structure-of-Arrays (SoA)** memory layout for spectral bins and complex components (`real` and `imag` in separate contiguous slices) to maximize SIMD throughput.
+
+---
+
+## Crate Layout & Module Architecture
+
+```
+aac/
+├── Cargo.toml                  # Workspace & Crate Manifest (edition = "2024")
+├── LICENSE                     # Apache 2.0 License
+├── README.md                   # Documentation, benchmarks & usage
+├── c/libxaac/                  # Reference C codebase for verification
+├── src/
+│   ├── lib.rs                  # Public API, prelude, features (decoder, encoder, simd, rayon)
+│   ├── error.rs                # Structured error types (BitstreamError, DecodeError, EncodeError)
+│   ├── types.rs                # Domain enums (AudioObjectType, ChannelConfig, SamplingRate)
+│   ├── buffer.rs               # AlignedBuffer<T>, AudioBuffer, ChannelView
+│   │
+│   ├── bitstream/              # Bitstream I/O & CRC
+│   │   ├── reader.rs           # Zero-copy BitReader (sub-byte peek, fast 64-bit extract)
+│   │   ├── writer.rs           # Fast BitWriter with byte alignment & bit packing
+│   │   └── crc.rs              # Hardware-accelerated / table CRC-16
+│   │
+│   ├── syntax/                 # Container & Header Parsers
+│   │   ├── adts.rs             # ADTS frame header parser & serializer
+│   │   ├── adif.rs             # ADIF header parser
+│   │   ├── latm.rs             # LOAS / LATM multiplex parser
+│   │   ├── asc.rs              # AudioSpecificConfig & ProgramConfigElement (PCE)
+│   │   └── raw.rs              # Raw bitstream handling
+│   │
+│   ├── dsp/                    # High-Performance DSP Engine
+│   │   ├── math.rs             # Exact fixed-point Q-format saturating math
+│   │   ├── fft.rs              # FFT / IFFT (Radix-2, Radix-4, mixed-radix)
+│   │   ├── mdct.rs             # MDCT / IMDCT (1024, 960, 512, 480, 128, 120)
+│   │   ├── qmf.rs              # 32/64 band Analysis & Synthesis QMF Filterbanks
+│   │   ├── window.rs           # Sine, KBD, and Low-Delay window generators
+│   │   ├── filterbank.rs       # Hybrid & polyphase filterbanks
+│   │   ├── lpc.rs              # Levinson-Durbin, LSF/ISP conversion, LPC synthesis
+│   │   ├── resampler.rs        # Polyphase audio resampler
+│   │   ├── simd/               # Target-specific SIMD implementations
+│   │   │   ├── generic.rs      # Portable auto-vectorized kernels
+│   │   │   ├── x86_avx2.rs     # AVX2 / AVX-512 kernels
+│   │   │   └── arm_neon.rs     # ARM NEON kernels
+│   │   └── asm/                # Inline assembly kernels (core::arch::asm!)
+│   │       ├── aarch64.rs      # ARM64 inline asm
+│   │       └── x86_64.rs       # x86_64 inline asm
+│   │
+│   ├── tables/                 # Mathematical & Standard Tables
+│   │   ├── huffman.rs          # AAC Huffman codebooks 1..11 & ESC
+│   │   ├── scalefactor.rs      # Scalefactor band definitions for all sample rates
+│   │   ├── sbr.rs              # SBR frequency tables, envelope codebooks & twiddles
+│   │   ├── ps.rs               # Parametric Stereo quantization tables
+│   │   ├── mps.rs              # MPEG Surround matrices & codebooks
+│   │   ├── usac.rs             # USAC arithmetic & AVQ codebooks
+│   │   └── drc.rs              # UniDRC curves & filter tables
+│   │
+│   ├── decoder/                # Decoding Subsystems
+│   │   ├── engine.rs           # High-level Decoder orchestrator
+│   │   ├── aac/                # AAC-LC / LD / ELD Core Decoder
+│   │   │   ├── channel.rs      # SCE, CPE, CCE, LFE parsing
+│   │   │   ├── huffman.rs      # Huffman spectral decoding & HCR/RVLC
+│   │   │   ├── dequant.rs      # Inverse quantization & scalefactors
+│   │   │   ├── stereo.rs       # M/S & Intensity Stereo
+│   │   │   ├── pns.rs          # Perceptual Noise Substitution
+│   │   │   ├── pulse.rs        # Pulse data tool
+│   │   │   ├── ltp.rs          # Long Term Prediction
+│   │   │   ├── tns.rs          # Temporal Noise Shaping inverse filter
+│   │   │   ├── imdct.rs        # IMDCT & overlap-add windowing
+│   │   │   └── concealment.rs  # Error concealment & loss recovery
+│   │   ├── sbr/                # SBR / eSBR Decoder (QMF, HF patch, Env, HBE, PVC)
+│   │   ├── ps/                 # Parametric Stereo Decoder (Hybrid filter, decorr, matrix)
+│   │   ├── mps/                # MPEG Surround Decoder (Trees 5.1/7.1, OTT, TTT, M1/M2)
+│   │   ├── usac/               # USAC Decoder (ACELP, TCX, FD, LPD, AVQ, Arith, FAC)
+│   │   └── drc/                # MPEG-D DRC Decoder (Loudness, EQ, Limiter)
+│   │
+│   ├── encoder/                # Encoding Subsystems
+│   │   ├── engine.rs           # High-level Encoder orchestrator
+│   │   ├── aac/                # AAC-LC / LD / ELD Core Encoder
+│   │   │   ├── block_switch.rs # Transient detection & block switching
+│   │   │   ├── psycho.rs       # Psychoacoustics & masking thresholds
+│   │   │   ├── tns.rs          # TNS analysis & filtering
+│   │   │   ├── stereo.rs       # M/S decision & complex prediction
+│   │   │   ├── quant.rs        # Two-loop rate-distortion quantizer
+│   │   │   ├── huffman.rs      # Dynamic Huffman codebook selection
+│   │   │   └── bitreservoir.rs # Bit reservoir management
+│   │   ├── sbr/                # SBR / eSBR Encoder
+│   │   ├── ps/                 # Parametric Stereo Encoder
+│   │   ├── mps/                # MPEG Surround Encoder
+│   │   ├── usac/               # USAC Encoder (Speech/Audio classification, ACELP/TCX)
+│   │   └── drc/                # DRC Encoder (BS.1770 loudness & gain curves)
+│   │
+│   └── bin/                    # High-Performance CLI Tools
+│       ├── aacdec.rs           # Multi-threaded AAC/USAC/DRC Decoder CLI (clap 4.5 + hound 3.5)
+│       └── aacenc.rs           # Multi-threaded AAC/HE-AAC/USAC Encoder CLI (clap 4.5 + hound 3.5)
+│
+├── tests/                      # Integration & Golden Vector Tests
+│   ├── golden_decoder.rs       # Bit-exact PCM comparison with C libxaac
+│   ├── golden_encoder.rs       # Bitstream comparison with C libxaac
+│   ├── multithread_stress.rs   # Rayon multi-channel & batch concurrency tests
+│   └── fuzz_targets/           # Fuzzing corpus for untrusted streams
+└── benches/                    # Performance Benchmarks (Criterion 0.5)
+    ├── decode_bench.rs         # Decoder speed vs C libxaac
+    ├── encode_bench.rs         # Encoder speed vs C libxaac
+    ├── dsp_transforms.rs       # IMDCT, QMF, FFT microbenchmarks
+    └── simd_vs_generic.rs      # SIMD speedup verification
+```
+
+---
+
+## Phased Implementation Plan
+
+### Phase 1: Cargo Workspace, Fixed-Point Math Engine & Table Ingestion
+- Initialize Cargo workspace with `edition = "2024"`, dependencies (`thiserror 2.0`, `aligned-vec 0.6`, `bytes 1.7`, `bitflags 2.6`, `byteorder 1.5`, `rayon 1.10`, `clap 4.5`, `hound 3.5`, `tracing 0.1`, `criterion 0.5`).
+- Implement `dsp::math`: Bit-exact fixed-point math operations (`saturate_32`, `saturate_16`, `mult_32x16_shl_sat`, `mult_32x32_sat`, `mac_32x32_to_64`, `div32_pos_normb`, `shr32_dir_sat_limit`, `shl32_dir_sat_limit`).
+- Ingest and verify all static tables in `src/tables/` (Huffman tables, scalefactor bands, twiddle factors, trigonometric values, window tables).
+- Add unit tests verifying `dsp::math` against C basic ops on exhaustive boundary values (`0x7FFFFFFF`, `0x80000000`, `0x7FFF`, `0x8000`, negative shifts, overflows).
+
+### Phase 2: Bitstream Engine, CRC & Syntax Demuxers
+- Implement zero-copy `BitReader<'a>`: sub-byte peek, fast unaligned 64-bit extract, byte alignment, and bit position tracking.
+- Implement `BitWriter`: bit packing, alignment byte flush, and dynamic buffer growth.
+- Implement hardware/table CRC-16 for ADTS, SBR, and DRC.
+- Implement syntax parsers: ADTS frame parser/writer, ADIF parser, AudioSpecificConfig (ASC) parser, Program Config Element (PCE) parser, and LATM / LOAS multiplexer.
+
+### Phase 3: SIMD & DSP Core Transforms
+- Implement FFT / IFFT (Radix-2, Radix-4, mixed-radix) with Generic, AVX2, and NEON paths.
+- Implement MDCT / IMDCT (1024, 960, 512, 480, 128, 120 points) with Sine, KBD, and Low-Delay windowing and vectorized pre/post twiddle.
+- Implement 32-band analysis and 64-band synthesis QMF filterbanks with vectorized polyphase filtering.
+- Implement Polyphase Audio Resampler.
+- Microbenchmark DSP transforms using `criterion 0.5` to verify SIMD performance gains over generic loops.
+
+### Phase 4: AAC-LC Core Decoder (Bit-Exact)
+- Implement frame orchestrator for Single Channel Element (SCE), Channel Pair Element (CPE), Channel Coupling Element (CCE), Low Frequency Element (LFE), and Data Stream Element (DSE).
+- Implement Huffman spectral decoding with HCR (Huffman Codebook Reordering) and RVLC (Reversible Variable Length Coding) error resilience.
+- Implement scalefactor decoding and inverse quantization ($x = \text{sign}(q) \cdot |q|^{4/3} \cdot 2^{(\text{sf}-100)/4}$).
+- Implement M/S Stereo, Intensity Stereo, PNS (Perceptual Noise Substitution), Pulse data tool, and TNS (Temporal Noise Shaping).
+- Implement IMDCT overlap-add windowing to generate final PCM frames.
+- Run golden-vector verification against C `libxaac` output to guarantee bit-exact PCM audio.
+
+### Phase 5: SBR / eSBR & Parametric Stereo (PS) Decoders (HE-AAC v1 / v2)
+- Parse SBR extension payloads and CRC validation.
+- Implement frequency band tables ($f_{master}$, $f_{high}$, $f_{low}$, $f_{noise}$, $f_{limiter}$).
+- Implement QMF analysis, HF patching / transposer, and inverse filtering.
+- Implement HF envelope adjustment, noise floor addition, and synthetic sinusoidal addition with SIMD acceleration.
+- Implement 64-band QMF synthesis to produce double-rate PCM.
+- Implement Parametric Stereo (PS) hybrid filterbank, decorrelator, and spatial stereo reconstruction matrix (HE-AAC v2).
+- Implement eSBR: Harmonic Band Extension (HBE), Predictive Vector Coding (PVC), and Inter-TES.
+- Validate bit-exact PCM against C reference for HE-AAC streams.
+
+### Phase 6: AAC-LD & AAC-ELD Decoders
+- Implement AAC-LD (512/480 point MDCT, Low Delay window, Long Term Prediction LTP).
+- Implement AAC-ELD (Low Delay SBR, LD-QMF filterbank, ELD windowing).
+
+### Phase 7: MPEG-D DRC Decoder (Dynamic Range Control)
+- Parse UniDRC bitstream payloads (loudness info, DRC gains, parametric DRC).
+- Implement DRC gain spline/linear interpolation and time-domain gain application.
+- Implement dynamic equalizer (EQ) filterbank and peak limiter.
+
+### Phase 8: MPEG-D USAC Core Decoder
+- Implement USAC spectral arithmetic decoding.
+- Implement Algebraic Vector Quantization (AVQ) decoding.
+- Implement Linear Prediction Domain (LPD): ACELP speech core and TCX transform decoding.
+- Implement Frequency Domain (FD) mode with USAC windowing and forward aliasing cancellation (FAC).
+
+### Phase 9: MPEG Surround (MPS) Multi-Channel Decoder
+- Parse MPS bitstream parameters (CLD, ICC, CPC, IPD, OPD).
+- Implement OTT (One-To-Two) and TTT (Two-To-Three) decoding blocks.
+- Implement M1 and M2 spatial rendering matrices for 5.1, 7.1, and binaural outputs.
+
+### Phase 10: High-Performance AAC-LC / LD / ELD Encoder
+- Implement transient detector and block switching (OnlyLong, LongStart, EightShort, LongStop).
+- Implement forward MDCT filterbank with SIMD windowing.
+- Implement Psychoacoustic Model: Bark band grouping, spreading function, masking thresholds, and perceptual entropy (parallelized across bands/channels using Rayon).
+- Implement TNS analysis and predictive filtering.
+- Implement M/S stereo decision and complex prediction.
+- Implement Two-Loop Rate-Distortion Quantizer with bit reservoir management.
+- Implement Dynamic Huffman bit counting and codebook selection.
+- Implement ADTS and RAW bitstream emission.
+
+### Phase 11: SBR, PS, USAC & DRC Encoders
+- Implement SBR Encoder: QMF analysis, transient detection, tonality correlation, envelope estimation, noise floor estimation, missing harmonics detection, and SBR payload bitstream generation.
+- Implement PS Encoder: parameter extraction (IID, ICC) and bitstream packing.
+- Implement USAC Encoder: Speech vs Music classifier, ACELP / TCX / FD encoding, and USAC bitstream multiplexing.
+- Implement DRC Encoder: BS.1770 loudness measurement, compression curve computation, and UniDRC metadata generation.
+
+### Phase 12: Multicore Parallelism (`rayon`), CLI Binaries, Benchmarking & Packaging
+- Implement Rayon multi-channel parallel decoding and encoding.
+- Implement multi-frame chunked batch processing in `aacdec` and `aacenc` CLIs.
+- Implement CLI binaries using `clap 4.5` and `hound 3.5`:
+  - `aacdec <input.aac|mp4> <output.wav> [--threads N] [--drc-profile P]`
+  - `aacenc <input.wav> <output.aac> [-b bitrate] [-a aot] [--threads N]`
+- Run comprehensive benchmarks (`criterion 0.5`) comparing Rust `xaac` throughput vs C `libxaac`.
+- Perform fuzz testing (`cargo fuzz`) on decoder and bitstream parsers.
+- Verify crate packaging (`cargo publish --dry-run`).
+
+---
+
+## Verification & Benchmarking Plan
+
+### Automated Verification
+1. **Mathematical Unit Tests**:
+   - `dsp::math` vs C basic ops: 100% bit-exact equivalence on edge-case matrices.
+   - FFT, MDCT, QMF, Windowing: Unit tests verifying exact transform properties and SIMD vs Generic parity.
+2. **Golden-Vector Bit-Exact Tests**:
+   - Compare Rust `xaac` decoded output against C `libxaac` output sample-for-sample across all test streams (`sine_2ch.wav`, speech, multichannel, ADTS streams).
+   - Ensure `assert_eq!(rust_sample, c_sample)` passes with 0 delta.
+3. **Roundtrip Consistency**:
+   - Encode test audio with Rust `aacenc` -> Decode with Rust `aacdec` and verify perceptual transparency and high SNR.
+4. **Fuzzing & Robustness**:
+   - `cargo test --all-targets`
+   - `cargo clippy --all-targets -- -D warnings`
+   - Continuous fuzzing with arbitrary corrupted bitstreams to guarantee panic-free resilience.
+5. **Speed & Throughput Benchmarks**:
+   - Criterion benchmarks comparing:
+     - Single-threaded Rust `xaac` vs Single-threaded C `libxaac` (verifying SIMD/LTO superiority).
+     - Multi-threaded Rust `xaac` with Rayon vs C `libxaac` (measuring multicore scaling).

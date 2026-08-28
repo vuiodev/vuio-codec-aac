@@ -1,0 +1,258 @@
+# Multi-Phase C to Rust Migration Plan for `libxaac` Audio Codec Suite
+
+## Executive Summary & Clarification
+
+### Why the previous report highlighted the migration status:
+As audited and documented in [`progress.txt`](file:///Users/alex/Documents/code/rust/aac/text/progress.txt) and [`plan4.txt`](file:///Users/alex/Documents/code/rust/aac/text/plan4.txt):
+- The C reference (`c/libxaac`) contains **246,000 LOC** across 302 files covering **9 codec families/subsystems**.
+- The prior session audited the starting state, fixed fundamental issues in the **AAC-LC decode core** (Huffman tables, inverse quantization, O(N²) MDCT bottleneck, NEON/SIMD vectorization) and basic AAC-LC encoding, achieving bit-exact decoding and **4,574× realtime** decode performance.
+- However, as detailed in the coverage audit table in [`progress.txt`](file:///Users/alex/Documents/code/rust/aac/text/progress.txt), **the broader C-to-Rust migration across the remaining 8 codec families is NOT done** — over 200k LOC of C code (SBR/eSBR, PS, MPEG Surround, USAC ACELP/TCX, UniDRC, RVLC/HCR, and advanced psychoacoustic encoding) remain as placeholders or are absent.
+
+This document establishes a **phased roadmap** to systematically migrate all missing C subsystems into pure, safe, high-performance **Rust 2024**.
+
+---
+
+## Architectural Constraint: Isolated New Files Only
+
+> [!IMPORTANT]
+> **Strict Non-Destructive Policy**: To guarantee zero regression on the verified AAC-LC core, **all migration phases will create ONLY new files and modules** (e.g. in distinct module namespaces like `src/codec_v2/`, `src/extensions/`, `src/usac_v2/`, `src/mps_v2/`, `src/sbr_v2/`, `src/resilience/`, etc.) and will **NOT touch or modify existing working files**.
+
+```mermaid
+graph TD
+    subgraph Existing Baseline (Untouched)
+        A[src/decoder/aac/*]
+        B[src/dsp/*]
+        C[src/encoder/aac/*]
+        D[src/syntax/*]
+    end
+
+    subgraph Phase 1: High-Efficiency SBR/eSBR & PS Extension
+        P1A[src/extensions/sbr/* (NEW)]
+        P1B[src/extensions/ps/* (NEW)]
+        P1C[src/extensions/tables/* (NEW)]
+    end
+
+    subgraph Phase 2: MPEG-D DRC (UniDRC) & Loudness
+        P2A[src/drc_v2/decoder/* (NEW)]
+        P2B[src/drc_v2/loudness/* (NEW)]
+        P2C[src/drc_v2/limiter/* (NEW)]
+    end
+
+    subgraph Phase 3: Error Resilience & Concealment
+        P3A[src/resilience/rvlc/* (NEW)]
+        P3B[src/resilience/hcr/* (NEW)]
+        P3C[src/resilience/concealment/* (NEW)]
+    end
+
+    subgraph Phase 4: MPEG Surround (MPS 5.1/7.1/3D)
+        P4A[src/mps_v2/bitdec/* (NEW)]
+        P4B[src/mps_v2/trees/* (NEW)]
+        P4C[src/mps_v2/spatial/* (NEW)]
+        P4D[src/mps_v2/decorr/* (NEW)]
+    end
+
+    subgraph Phase 5: MPEG-D USAC Core (Speech & Music)
+        P5A[src/usac_v2/arith/* (NEW)]
+        P5B[src/usac_v2/avq/* (NEW)]
+        P5C[src/usac_v2/acelp/* (NEW)]
+        P5D[src/usac_v2/tcx/* (NEW)]
+        P5E[src/usac_v2/lpd/* (NEW)]
+    end
+
+    subgraph Phase 6: Production Encoder & Psychoacoustics
+        P6A[src/encoder_v2/psycho/* (NEW)]
+        P6B[src/encoder_v2/rate_control/* (NEW)]
+        P6C[src/encoder_v2/sbr_enc/* (NEW)]
+        P6D[src/encoder_v2/usac_enc/* (NEW)]
+    end
+```
+
+---
+
+## Migration Phases Breakdown
+
+---
+
+### Phase 1: Complete SBR, eSBR (HBE/PVC), & Parametric Stereo (PS) Decoding
+**Target C Subsystem**: `c/libxaac/decoder/ixheaacd_sbr_*.c`, `ixheaacd_env_*.c`, `ixheaacd_esbr_*.c`, `ixheaacd_hbe_*.c`, `ixheaacd_pvc_*.c`, `ixheaacd_ps_*.c` (~30,000 C LOC).
+
+#### Technical Objectives:
+1. **64-band Complex Analysis & Synthesis QMF Bank**:
+   - Zero-allocation 64-band polyphase filtering with NEON/AVX2 SIMD SIMD inner products.
+   - Dual-rate (core rate $\to$ $2\times$ output rate) and downsampled single-rate modes.
+2. **High-Frequency Generation (HF Adjuster & Envelope Calculation)**:
+   - Patch generation from core subbands, frequency band table builders (`f_master`, `f_table_res`, `f_lim`).
+   - Inverse filtering level estimation (chirp factor smoothing).
+   - Envelope scaling, noise floor injection, and synthetic sinusoidal missing harmonic addition.
+3. **eSBR Enhancements**:
+   - **HBE (Harmonic Bandwidth Extension)**: Phase vocoder / DFT-based transposer (`ixheaacd_hbe_trans.c`).
+   - **PVC (Predicted Vector Coding)**: Prediction of high-frequency subband envelopes from low-frequency envelope shapes.
+   - **Inter-TES (Inter-subband Time Envelope Shaping)**.
+4. **Parametric Stereo (PS) Multi-Band Decoding**:
+   - 20-band and 34-band hybrid filterbank splitting subband 0..2 into sub-subbands.
+   - Decoding spatial parameters: Inter-channel Intensity Differences (IID), Inter-channel Coherence (ICC), Inter-channel Phase Differences (IPD), and Overall Phase Differences (OPD).
+   - Fractional-delay all-pass decorrelator network and stereo synthesis mixing matrix ($M = \begin{bmatrix} H_{11} & H_{12} \\ H_{21} & H_{22} \end{bmatrix}$).
+
+#### New Files to Create:
+- `[NEW]` `src/extensions/mod.rs` - Extension subsystem root
+- `[NEW]` `src/extensions/sbr/mod.rs` - Full SBR/eSBR pipeline manager
+- `[NEW]` `src/extensions/sbr/qmf_cplx.rs` - 64-subband Complex QMF SIMD engine
+- `[NEW]` `src/extensions/sbr/freq_tables.rs` - Master and subband frequency tables derivation
+- `[NEW]` `src/extensions/sbr/env_calc.rs` - Envelope calculation and gain limiter
+- `[NEW]` `src/extensions/sbr/hbe.rs` - Harmonic Bandwidth Extension (DFT transposer)
+- `[NEW]` `src/extensions/sbr/pvc.rs` - Predicted Vector Coding prediction matrix
+- `[NEW]` `src/extensions/ps/mod.rs` - Parametric Stereo decoder
+- `[NEW]` `src/extensions/ps/hybrid_bank.rs` - 20/34-band hybrid QMF decomposition
+- `[NEW]` `src/extensions/ps/decorrelator.rs` - Fractional delay all-pass filter network
+- `[NEW]` `src/extensions/ps/synth_matrix.rs` - Spatial mixing and rotation matrix
+- `[NEW]` `src/extensions/tables/sbr_rom.rs` - Precomputed QMF, HBE twiddles and ROM tables
+
+---
+
+### Phase 2: MPEG-D DRC (UniDRC), BS.1770 Loudness, & Peak Limiter
+**Target C Subsystem**: `c/libxaac/decoder/drc_src/*`, `c/libxaac/decoder/ixheaacd_peak_limiter.c` (~18,000 C LOC).
+
+#### Technical Objectives:
+1. **UniDRC Bitstream Parsing (ISO/IEC 23003-4)**:
+   - Dynamic Range Control gains, multi-band frequency split configurations, ducking metadata, and parametric EQ definitions.
+2. **Gain Interpolation & Multi-Band Processing**:
+   - Spline and linear gain interpolation across subband time frames.
+   - Frequency-domain and time-domain gain application across selected channel groups.
+3. **Loudness Normalization Engine**:
+   - Program reference level adjustment to user-defined target (e.g. -23 LUFS / -14 LUFS).
+4. **True Peak Limiter**:
+   - Attack/decay envelope tracking, oversampled peak detection ($4\times$ interpolation), and transparent anti-clipping gain reduction (`ixheaacd_peak_limiter.c`).
+
+#### New Files to Create:
+- `[NEW]` `src/drc_v2/mod.rs` - UniDRC subsystem entry
+- `[NEW]` `src/drc_v2/bitstream.rs` - ISO/IEC 23003-4 bitstream parser
+- `[NEW]` `src/drc_v2/gain_spline.rs` - Gain interpolation curves & subband splitting
+- `[NEW]` `src/drc_v2/eq.rs` - Parametric equalizer cascade
+- `[NEW]` `src/drc_v2/loudness.rs` - BS.1770 / EBU R128 loudness normalizer
+- `[NEW]` `src/drc_v2/limiter.rs` - Oversampled true-peak brickwall limiter
+
+---
+
+### Phase 3: Error Resilience (RVLC, HCR) & Audio Concealment
+**Target C Subsystem**: `c/libxaac/decoder/ixheaacd_rev_vlc.c`, `ixheaacd_huff_code_reorder.c`, `ixheaacd_aac_ec.c`, `ixheaacd_usac_ec.c` (~4,800 C LOC).
+
+#### Technical Objectives:
+1. **Reversible Variable Length Coding (RVLC)**:
+   - Bidirectional scalefactor decoding: forward decoding until bit error, backward decoding from end of RVLC payload, and error boundary recovery.
+2. **Huffman Codebook Reordering (HCR)**:
+   - Segment-based decoding that places high-priority spectral segments into fixed-length segments and spills remaining bits into non-fixed segments, preventing bit errors from corrupting the entire frame.
+3. **Spectral Concealment & Fade Engine**:
+   - Frame loss state machine: Spectral extrapolation, energy decay factor per frame loss count (e.g. -3 dB per frame), random noise shape insertion, and smooth fade-in upon frame recovery.
+
+#### New Files to Create:
+- `[NEW]` `src/resilience/mod.rs` - Error resilience manager
+- `[NEW]` `src/resilience/rvlc.rs` - Bidirectional RVLC decoder
+- `[NEW]` `src/resilience/hcr.rs` - Segment-based Huffman Codebook Reordering
+- `[NEW]` `src/resilience/concealment.rs` - Frame loss error concealment state machine
+
+---
+
+### Phase 4: MPEG Surround (MPS) Multi-Channel Audio (5.1 / 7.1 / 3D Binaural)
+**Target C Subsystem**: `c/libxaac/decoder/ixheaacd_mps_*.c`, `ixheaacd_ld_mps_*.c` (~35,300 C LOC).
+
+#### Technical Objectives:
+1. **MPS Bitstream Demuxing & Syntax Parsing**:
+   - Parsing spatial audio frames: Tree configurations (5.1: 5-1-5, 5-2-5; 7.1: 7-2-7, 7-5-7; Binaural 3D), Channel Level Differences (CLD), Inter-channel Coherence (ICC), Channel Prediction Coefficients (CPC), IPD/OPD.
+2. **Spatial Synthesis Box (OTT & TTT)**:
+   - One-To-Two (OTT) and Two-To-Three (TTT) spatial synthesis nodes.
+   - Calculation of spatial transformation matrices $M_1$ and $M_2$.
+3. **Temporal Processing & Smoothing**:
+   - Subband temporal envelope shaping (TES), tonality analysis, and adaptive parameter smoothing across frames to eliminate spatial pumping.
+4. **Multi-Channel Decorrelation Network**:
+   - Multi-channel lattice all-pass decorrelators with orthogonalizing delay lines.
+
+#### New Files to Create:
+- `[NEW]` `src/mps_v2/mod.rs` - MPEG Surround subsystem entry
+- `[NEW]` `src/mps_v2/bitdec.rs` - Spatial parameter bitstream decoder
+- `[NEW]` `src/mps_v2/trees.rs` - Spatial tree configs (5.1, 7.1, Binaural)
+- `[NEW]` `src/mps_v2/m1m2.rs` - $M_1 / M_2$ spatial matrix computation
+- `[NEW]` `src/mps_v2/ott_ttt.rs` - One-To-Two & Two-To-Three spatial synthesis boxes
+- `[NEW]` `src/mps_v2/decorr.rs` - Multi-channel decorrelation filterbank
+- `[NEW]` `src/mps_v2/smoothing.rs` - Adaptive parameter smoothing & TES
+- `[NEW]` `src/mps_v2/rom.rs` - MPEG Surround lookup tables
+
+---
+
+### Phase 5: MPEG-D USAC (Unified Speech & Audio Coding) Decoder
+**Target C Subsystem**: `c/libxaac/decoder/ixheaacd_arith_dec.c`, `ixheaacd_avq_dec.c`, `ixheaacd_acelp_*.c`, `ixheaacd_tcx_*.c`, `ixheaacd_lpc*.c` (~30,000+ C LOC).
+
+#### Technical Objectives:
+1. **Spectral Arithmetic Decoding**:
+   - Context-adaptive binary arithmetic decoding of frequency domain (FD) spectral coefficients with multi-symbol state tables.
+2. **Algebraic Vector Quantization (AVQ)**:
+   - 8-dimensional lattice vector quantization decoding ($D_8$ and $E_8$ Gosset lattices, Voronoi extension).
+3. **ACELP Speech Core (Linear Prediction Domain - LPD)**:
+   - Line Spectral Frequencies (LSF/ISP) quantization and interpolation.
+   - Adaptive codebook pitch predictor (fractional pitch lag with polyphase Sinc interpolation).
+   - Algebraic fixed codebook pulse search/synthesis.
+   - High-order LPC synthesis filter ($1/A(z)$) and de-emphasis filtering.
+4. **TCX (Transform Coded Excitation) & FAC**:
+   - 20ms, 40ms, and 80ms TCX MDCT transform cores.
+   - Forward Aliasing Cancellation (FAC) synthesis between ACELP and MDCT transitions.
+
+#### New Files to Create:
+- `[NEW]` `src/usac_v2/mod.rs` - USAC decoder engine
+- `[NEW]` `src/usac_v2/arith_dec.rs` - Context-adaptive spectral arithmetic decoder
+- `[NEW]` `src/usac_v2/avq_dec.rs` - $D_8 / E_8$ lattice Algebraic Vector Quantization
+- `[NEW]` `src/usac_v2/lpc.rs` - LSF/ISP conversion, LPC synthesis filter
+- `[NEW]` `src/usac_v2/acelp.rs` - ACELP algebraic excitation decoder & pitch predictor
+- `[NEW]` `src/usac_v2/tcx.rs` - TCX-20/40/80 transform excitation engine
+- `[NEW]` `src/usac_v2/fac.rs` - Forward Aliasing Cancellation (FAC) engine
+- `[NEW]` `src/usac_v2/rom.rs` - USAC arithmetic, AVQ, and ACELP codebook tables
+
+---
+
+### Phase 6: High-Quality Production AAC/USAC/SBR Encoder Subsystems
+**Target C Subsystem**: `c/libxaac/encoder/*` (~80,000 C LOC).
+
+#### Technical Objectives:
+1. **Psychoacoustic Model (Bark Scale Masking & Tonality)**:
+   - Bark/ERB scale subband energy partitioning, spreading function convolutions, tonality index calculation (spectral unpredictability measure), and sound masking thresholds ($SMR / SNR$).
+2. **Two-Loop Rate-Distortion Optimization Quantizer**:
+   - Outer loop: Scalefactor distortion control to maintain error below psychoacoustic masking threshold.
+   - Inner loop: Bit budget regulation via global gain adjustment and Huffman codebook cost evaluation.
+3. **Bit Reservoir & Rate Control**:
+   - Dynamic bit allocation across difficult transient frames and steady-state frames.
+4. **SBR / PS / USAC Parameter Extractors**:
+   - SBR: Analysis QMF bank, transient detection, envelope energy extraction, tonality and missing harmonics estimation.
+   - PS: Hybrid subband analysis, IID/ICC extraction, and downmixing.
+   - USAC: Speech vs Music classifier, ACELP open-loop and closed-loop pitch search, algebraic pulse selection.
+
+#### New Files to Create:
+- `[NEW]` `src/encoder_v2/mod.rs` - Production encoder entry point
+- `[NEW]` `src/encoder_v2/psycho/mod.rs` - Advanced psychoacoustic model
+- `[NEW]` `src/encoder_v2/psycho/spreading.rs` - Bark scale masking spreading function
+- `[NEW]` `src/encoder_v2/psycho/tonality.rs` - Spectral unpredictability & tonality estimator
+- `[NEW]` `src/encoder_v2/quant/two_loop.rs` - Two-loop rate-distortion quantizer
+- `[NEW]` `src/encoder_v2/quant/reservoir.rs` - Bit reservoir manager
+- `[NEW]` `src/encoder_v2/sbr_enc/mod.rs` - SBR envelope & parameter extraction engine
+- `[NEW]` `src/encoder_v2/ps_enc/mod.rs` - PS parameter extraction & downmix generator
+- `[NEW]` `src/encoder_v2/usac_enc/mod.rs` - USAC ACELP pitch search & mode selector
+
+---
+
+## Verification & Golden Oracle Strategy
+
+For every phase:
+1. **C Reference Golden Vectors**: Run `c/libxaac` binary tools against reference WAV files to generate golden reference bitstreams and decoded PCM.
+2. **Bit-Exact / SNR Conformance Harness**: Compare sample-by-sample output against `c/libxaac` (SNR $\ge 70\text{ dB}$ or exact bit-for-bit for fixed point, exact bitstream matching for entropy enc/dec).
+3. **Continuous Test Suite**: Every new module contains dedicated unit tests covering bitstream round-trips, table integrity, and transform invertibility.
+4. **Regression Protection**: Zero edits to existing files ensures all 146+ baseline tests continue to pass without interference.
+
+---
+
+## Phased Execution Roadmap Summary
+
+| Phase | Subsystem Description | Target C LOC | Key Deliverables |
+| :--- | :--- | :--- | :--- |
+| **Phase 1** | Complete SBR/eSBR & Parametric Stereo | ~30,000 | 64-band complex QMF, HBE transposer, PVC, PS hybrid filterbank, decorrelator |
+| **Phase 2** | MPEG-D DRC (UniDRC) & Peak Limiter | ~18,000 | ISO/IEC 23003-4 parser, spline gains, parametric EQ, BS.1770 normalizer, peak limiter |
+| **Phase 3** | Error Resilience & Concealment | ~4,800 | RVLC bidirectional decoder, HCR codebook reordering, spectral fade concealment |
+| **Phase 4** | MPEG Surround (MPS) 5.1/7.1/3D | ~35,300 | Spatial bitstream parser, OTT/TTT boxes, M1/M2 matrix, multi-channel decorrelation |
+| **Phase 5** | MPEG-D USAC Core (Speech & Music) | ~30,000+ | Arithmetic spectral decoding, AVQ ($D_8/E_8$), ACELP speech core, TCX-20/40/80, FAC |
+| **Phase 6** | Advanced Production Encoders | ~80,000 | Full psychoacoustic model, two-loop rate distortion, SBR/PS/USAC parameter extraction |
