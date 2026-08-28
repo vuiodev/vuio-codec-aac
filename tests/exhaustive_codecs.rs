@@ -110,8 +110,10 @@ fn test_sbr_and_ps_end_to_end() {
     let baseband: Vec<f32> = (0..SBR_CORE_FRAME)
         .map(|i| 0.5 * ((i as f32) * 0.05).sin())
         .collect();
-    let payload = sbr_enc.encode_sbr_frame(&baseband).unwrap();
-    assert!(!payload.is_empty());
+    // SBR *encode* is not implemented; the contract is that it says so rather
+    // than emitting a payload no decoder can read. SBR decode below is real.
+    let sbr_enc_err = sbr_enc.encode_sbr_frame(&baseband).unwrap_err();
+    assert!(matches!(sbr_enc_err, vuiocodecaac::error::Error::Unimplemented { .. }));
 
     let mut output_2x = vec![0.0f32; sbr.output_frame_len()];
     sbr.process_channel(0, &baseband, &mut output_2x).unwrap();
@@ -152,13 +154,16 @@ fn test_sbr_and_ps_end_to_end() {
 
 #[test]
 fn test_mps_usac_and_drc() {
-    // MPS 5.1
+    // MPS is not implemented; the contract is that it says so rather than
+    // returning a fabricated upmix.
     let mps = MpsDecoder::new(0);
     let left = vec![1.0f32; 512];
     let right = vec![0.5f32; 512];
     let mut out_5point1 = vec![vec![0.0f32; 512]; 6];
-    mps.decode_5point1(&left, &right, &MpsSpatialCues::default(), &mut out_5point1).unwrap();
-    assert_eq!(out_5point1[0].len(), 512);
+    let mps_err = mps
+        .decode(&[&left, &right], &MpsSpatialCues::default(), &mut out_5point1)
+        .unwrap_err();
+    assert!(matches!(mps_err, vuiocodecaac::error::Error::Unimplemented { .. }));
 
     // USAC
     let usac_enc = UsacEncoder::new();
@@ -167,11 +172,17 @@ fn test_mps_usac_and_drc() {
     let mode = usac_enc.classify_frame(&pcm);
     assert_eq!(mode, UsacCoreMode::LpdMode);
 
-    let mut acelp_out = vec![0.0f32; 64];
-    let bytes = [0u8; 8];
+    // One all-ACELP LPD frame, straight off a bitstream: core_mode 2, lpd_mode
+    // 0, then the subframe payload.
+    let mut bytes = vec![0x40u8, 0x00];
+    bytes.extend(std::iter::repeat_n(0x9Cu8, 62));
     let mut reader = BitReader::new(&bytes);
-    usac_dec.decode_acelp_subframe(&mut reader, 16, 0.7, 0.4, &mut acelp_out).unwrap();
-    assert_eq!(acelp_out.len(), 64);
+    let lsf = vuiocodecaac::decoder::usac::lsf::dequantize_lsf_abs(120);
+    let mut acelp_out = vec![0.0f32; UsacDecoder::frame_len()];
+    usac_dec.decode_lpd_frame(&mut reader, &lsf, 0.8, &mut acelp_out).unwrap();
+    assert_eq!(acelp_out.len(), 256);
+    assert!(acelp_out.iter().all(|x| x.is_finite()));
+    assert!(acelp_out.iter().any(|x| *x != 0.0), "a real ACELP frame is not silence");
 
     // DRC: measure a frame, write its metadata, and read it back through the
     // decoder, which must then attenuate a loud programme.

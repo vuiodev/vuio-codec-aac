@@ -2,6 +2,7 @@
 
 pub mod channel;
 pub mod dequant;
+pub mod downmix;
 pub mod huffman;
 pub mod ics;
 pub mod pns;

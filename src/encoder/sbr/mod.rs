@@ -1,57 +1,67 @@
-//! Spectral Band Replication (SBR / eSBR) Encoder Subsystem
+//! Spectral Band Replication (SBR) encoder — **not implemented**.
 //!
-//! Analyzes baseband audio and high-frequency content, estimates envelope energies,
-//! detects missing harmonics, and generates standard SBR extension payloads (ISO/IEC 14496-3 Part 4).
+//! A real SBR encoder runs the input through a QMF analysis bank, decides an
+//! envelope time/frequency grid from where transients fall, estimates envelope
+//! energies, noise floors, inverse-filtering levels and missing harmonics over
+//! that grid, then delta-codes the lot into an `sbr_extension_data()` payload
+//! the decoder in [`crate::decoder::sbr`] can read.
+//!
+//! None of that is here.
+//!
+//! # Why this is an error and not an approximation
+//!
+//! An earlier revision ran a genuine QMF analysis, discarded everything except
+//! a scalar energy average, and returned five hard-coded bytes
+//! (`[0x00, 0x2A, 0x44, 0x80, quantised_energy]`) described as an SBR payload.
+//! No decoder can read that — not this crate's own, which is the point. The
+//! only reason the encoder still emitted valid streams is that
+//! [`crate::encoder::engine`] never called it.
+//!
+//! Returning a wrong payload is worse than returning nothing, because a caller
+//! who wires it up gets a stream that looks like HE-AAC and is not, so this now
+//! refuses.
+//!
+//! # Porting this for real
+//!
+//! `text/plan.txt` phase 4, ~20,000 lines of C in
+//! `c/libxaac/encoder/ixheaace_sbr_*.c`. The decode side is already implemented
+//! and tested here, which makes this unusually pleasant to verify: encode,
+//! decode with [`crate::decoder::sbr`], and compare against the input's high
+//! band. Start with `ixheaace_sbr_qmf_enc.c` and `ixheaace_sbr_frame_info_gen.c`.
 
-use crate::dsp::fft::Complex32;
-use crate::dsp::qmf::QmfAnalysis;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
-/// SBR Encoder Configuration and State.
+/// SBR encoder configuration and state.
 pub struct SbrEncoder {
-    _sample_rate: u32,
-    _bitrate: u32,
-    qmf_analysis: QmfAnalysis,
+    sample_rate: u32,
+    bitrate: u32,
 }
 
 impl SbrEncoder {
-    /// Create a new SBR encoder instance.
+    /// Create an SBR encoder for a target rate.
     pub fn new(sample_rate: u32, bitrate: u32) -> Self {
-        Self {
-            _sample_rate: sample_rate,
-            _bitrate: bitrate,
-            qmf_analysis: QmfAnalysis::new(),
-        }
+        Self { sample_rate, bitrate }
     }
 
-    /// Analyze audio frame and generate SBR envelope payload bytes.
-    pub fn encode_sbr_frame(&mut self, pcm_frame: &[f32]) -> Result<Vec<u8>> {
-        assert_eq!(pcm_frame.len(), 1024);
+    /// The core sampling rate this encoder was configured for.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
 
-        // Perform 32-band QMF analysis over 32 time-slots
-        let mut slot_energies = [0.0f32; 32];
-        for (slot, slot_energy) in slot_energies.iter_mut().enumerate() {
-            let chunk = &pcm_frame[slot * 32..(slot + 1) * 32];
-            let mut anal_out = [Complex32::default(); 32];
-            self.qmf_analysis.process_slot(chunk, &mut anal_out);
+    /// The target bitrate this encoder was configured for.
+    pub fn bitrate(&self) -> u32 {
+        self.bitrate
+    }
 
-            let energy: f32 = anal_out.iter().map(|c| c.re * c.re + c.im * c.im).sum();
-            *slot_energy = energy;
-        }
-
-        // Generate SBR payload: header + envelope quantizations
-        let mut sbr_payload = vec![
-            0x00, // SBR header info
-            0x2A, // Frequency band grid (FIXFIX)
-            0x44, // Quantized envelope energies
-            0x80,
-        ];
-
-        let avg_energy = slot_energies.iter().sum::<f32>() / 32.0;
-        let quant_val = (avg_energy.log2() * 4.0).clamp(0.0, 63.0) as u8;
-        sbr_payload.push(quant_val);
-
-        Ok(sbr_payload)
+    /// Analyse one frame and produce its SBR extension payload.
+    ///
+    /// Always returns [`Error::Unimplemented`]. See this module's documentation
+    /// for why it refuses rather than emitting a payload no decoder can read.
+    pub fn encode_sbr_frame(&mut self, _pcm_frame: &[f32]) -> Result<Vec<u8>> {
+        Err(Error::Unimplemented {
+            tool: "SBR encode",
+            detail: "text/plan.txt phase 4; c/libxaac/encoder/ixheaace_sbr_*.c",
+        })
     }
 }
 
@@ -60,10 +70,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sbr_encoder_frame_payload() {
-        let mut sbr_enc = SbrEncoder::new(44100, 128000);
-        let pcm = vec![0.25f32; 1024];
-        let payload = sbr_enc.encode_sbr_frame(&pcm).unwrap();
-        assert!(!payload.is_empty());
+    fn encoding_is_refused_rather_than_emitting_an_unreadable_payload() {
+        let mut enc = SbrEncoder::new(44100, 128_000);
+        let err = enc.encode_sbr_frame(&vec![0.25f32; 1024]).unwrap_err();
+        assert!(matches!(err, Error::Unimplemented { .. }));
     }
 }

@@ -1,11 +1,38 @@
-//! Parametric Stereo (PS) Encoder Subsystem
+//! Parametric Stereo (PS) encoder — **not implemented**.
 //!
-//! Extracts Inter-channel Intensity Differences (IID) and Inter-channel Coherence (ICC)
-//! from a stereo pair and produces a mono downmix (ISO/IEC 14496-3 Part 3 Subpart 8).
+//! A real PS encoder takes a stereo pair into the hybrid QMF domain, extracts
+//! Inter-channel Intensity Differences, Inter-channel Coherence and (optionally)
+//! phase differences *per hybrid subband per parameter set*, quantises them
+//! against the standard's IID/ICC tables, delta-codes them across time or
+//! frequency, and writes a `ps_data()` payload alongside a mono downmix.
+//!
+//! None of that is here.
+//!
+//! # Why this is an error and not an approximation
+//!
+//! An earlier revision computed one broadband IID and one broadband ICC from
+//! time-domain energies, produced a `0.5*(l+r)` downmix, and returned them in a
+//! struct. Real PS parameters are per band and per parameter set; a single
+//! broadband pair cannot represent the stereo image the decoder expects, and no
+//! payload was written at all, so nothing could consume it. It was never called
+//! by [`crate::encoder::engine`].
+//!
+//! # Porting this for real
+//!
+//! `text/plan.txt` phase 4.6, ~1,600 lines of C:
+//! `ixheaace_ps_enc.c`, `ixheaace_ps_bitenc.c`, `ixheaace_ps_enc_init.c` and the
+//! encoder-side hybrid filterbank in `ixheaace_hybrid.c`. The decode side —
+//! [`crate::decoder::ps`], including its hybrid filterbank and decorrelator —
+//! is implemented and tested, so a round trip is the natural oracle. PS also
+//! depends on SBR encode (phase 4.1-4.5) being in place first, since PS travels
+//! inside the SBR extension payload.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Parameters one frame of parametric stereo carries.
+///
+/// Kept as the shape the real encoder will fill in. `iid_indices` and
+/// `icc_indices` are per hybrid band, not scalars.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PsFrameData {
     pub enable_iid: bool,
@@ -15,7 +42,8 @@ pub struct PsFrameData {
     pub icc_indices: Vec<u8>,
 }
 
-/// PS Encoder instance.
+/// PS encoder instance.
+#[derive(Debug, Default, Clone, Copy)]
 pub struct PsEncoder;
 
 impl PsEncoder {
@@ -23,52 +51,20 @@ impl PsEncoder {
         Self
     }
 
-    /// Extract PS parameters and generate a mono downmix frame.
+    /// Extract PS parameters and produce the mono downmix that accompanies them.
+    ///
+    /// Always returns [`Error::Unimplemented`]. See this module's documentation
+    /// for why it refuses rather than returning broadband stand-ins.
     pub fn encode_stereo(
         &self,
-        left: &[f32],
-        right: &[f32],
-        mono_downmix: &mut [f32],
+        _left: &[f32],
+        _right: &[f32],
+        _mono_downmix: &mut [f32],
     ) -> Result<PsFrameData> {
-        assert_eq!(left.len(), right.len());
-        assert_eq!(left.len(), mono_downmix.len());
-
-        let mut left_energy = 0.0f32;
-        let mut right_energy = 0.0f32;
-        let mut cross_corr = 0.0f32;
-
-        for i in 0..left.len() {
-            let l = left[i];
-            let r = right[i];
-            mono_downmix[i] = 0.5 * (l + r);
-            left_energy += l * l;
-            right_energy += r * r;
-            cross_corr += l * r;
-        }
-
-        // Calculate IID index
-        let iid_ratio = (left_energy + 1e-6) / (right_energy + 1e-6);
-        let iid_db = 10.0 * iid_ratio.log10();
-        let iid_idx = (iid_db * 0.5).round().clamp(-7.0, 7.0) as i8;
-
-        // Calculate ICC index
-        let denom = (left_energy * right_energy + 1e-6).sqrt();
-        let coherence = (cross_corr / denom).clamp(0.0, 1.0);
-        let icc_idx = ((1.0 - coherence) * 7.0).round().clamp(0.0, 7.0) as u8;
-
-        Ok(PsFrameData {
-            enable_iid: true,
-            enable_icc: true,
-            enable_ipd: false,
-            iid_indices: vec![iid_idx],
-            icc_indices: vec![icc_idx],
+        Err(Error::Unimplemented {
+            tool: "Parametric Stereo encode",
+            detail: "text/plan.txt phase 4.6; c/libxaac/encoder/ixheaace_ps_*.c",
         })
-    }
-}
-
-impl Default for PsEncoder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -77,14 +73,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ps_encoder_downmix_and_extraction() {
-        let ps_enc = PsEncoder::new();
-        let left = vec![1.0f32; 512];
-        let right = vec![0.5f32; 512];
+    fn encoding_is_refused_rather_than_returning_broadband_stand_ins() {
+        let enc = PsEncoder::new();
         let mut downmix = vec![0.0f32; 512];
-
-        let data = ps_enc.encode_stereo(&left, &right, &mut downmix).unwrap();
-        assert_eq!(downmix[0], 0.75);
-        assert!(!data.iid_indices.is_empty());
+        let err =
+            enc.encode_stereo(&vec![1.0f32; 512], &vec![0.5f32; 512], &mut downmix).unwrap_err();
+        assert!(matches!(err, Error::Unimplemented { .. }));
+        assert!(downmix.iter().all(|s| *s == 0.0), "output must be untouched");
     }
 }

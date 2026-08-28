@@ -13,10 +13,29 @@
 //!
 //! Spectral Band Replication is implemented: an HE-AAC stream decodes at its full
 //! nominal sample rate, with the replicated range reconstructed from the transmitted
-//! envelopes, noise floors and added sinusoids. Parametric Stereo, MPEG Surround,
-//! USAC and DRC are **not** implemented. The encoder emits conformant AAC-LC but
-//! has no psychoacoustic model, so its quality at a given bitrate is well below a
-//! mature encoder's.
+//! envelopes, noise floors and added sinusoids. Parametric Stereo is implemented, so
+//! HE-AAC v2 decodes to stereo. The encoder emits conformant AAC-LC with a real
+//! psychoacoustic model, block switching, TNS and mid/side.
+//!
+//! ## What is not implemented
+//!
+//! `text/plan.txt` is the authoritative audit against the C reference, file by file.
+//! In short:
+//!
+//! * **MPEG Surround** — not implemented; [`decoder::mps`] returns
+//!   [`error::Error::Unimplemented`] rather than approximating.
+//! * **SBR and PS encode** — not implemented, same treatment. The *decode* side of
+//!   both is real, so this crate reads HE-AAC v1/v2 but cannot write it.
+//! * **USAC / xHE-AAC** — the Frequency Domain core and the ACELP speech core are
+//!   implemented; TCX, FAC and the ISO `UsacConfig()`/`UsacFrame()` framing are not,
+//!   so USAC currently round-trips only through this crate's own container.
+//! * **MPEG-D uniDRC** — only the legacy `dynamic_range_info()` element is handled.
+//! * **AAC-LD / ELD**, error resilience (HCR, RVLC), error concealment, LTP and
+//!   coupling-channel gains — not implemented; where the syntax must still be
+//!   traversed to stay bit-aligned, it is parsed and skipped.
+//!
+//! Nothing in this crate returns a fabricated result for an unimplemented tool: the
+//! rule is an error, never a plausible-looking wrong answer.
 //!
 //! ## Quickstart: Decoding an AAC Stream
 //!

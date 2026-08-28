@@ -23,6 +23,7 @@
 //! therefore emits, for each core frame, a window that ends six QMF slots before
 //! that frame does; see [`hf`] for the buffer layout that implements it.
 
+pub mod crc;
 pub mod data;
 pub mod grid;
 pub mod hf;
@@ -209,20 +210,33 @@ impl SbrDecoder {
     /// A payload that cannot be parsed leaves the previous frame's state alone and
     /// reports the error; the caller may then either drop the frame or let the core
     /// signal through unreplicated.
+    /// `payload_bits_remaining` is how many bits of this fill element's SBR
+    /// payload are left when this is called (its declared byte count, less
+    /// the 4-bit extension-type nibble the caller already consumed to learn
+    /// `with_crc`) -- needed only to size the CRC's protected span correctly;
+    /// callers with no payload-length tracking may pass `usize::MAX` and rely
+    /// on `sbr_crc_check`'s own clamp to "however much of the reader remains",
+    /// which is correct as long as this fill element is the last thing in the
+    /// buffer the caller hands in.
     pub fn decode_extension(
         &mut self,
         reader: &mut BitReader,
         element: SbrElement,
         with_crc: bool,
+        payload_bits_remaining: usize,
     ) -> Result<()> {
         for ch in &mut self.channels {
             ch.have_data = false;
         }
 
         if with_crc {
-            // The CRC covers the payload that follows. Nothing here acts on a
-            // mismatch, so it is read only to stay aligned.
-            let _crc = reader.read_u16(10)?;
+            let protected_bits = payload_bits_remaining.saturating_sub(crc::CRC_BITS);
+            if !crc::sbr_crc_check(reader, protected_bits)? {
+                return Err(DecodeError::CorruptedFrame(
+                    "SBR payload failed its CRC-10 check".into(),
+                )
+                .into());
+            }
         }
 
         if reader.read_bit()? {
@@ -643,6 +657,64 @@ fn read_extended_data(
 mod tests {
     use super::*;
 
+    /// A payload whose transmitted CRC does not match its content must be
+    /// refused with the CRC-specific error, not silently accepted or
+    /// rejected for some unrelated reason -- this is the actual wiring
+    /// [`crc::sbr_crc_check`] exists to be used from.
+    #[test]
+    fn a_payload_with_a_mismatched_crc_is_refused() {
+        use crate::bitstream::BitWriter;
+
+        let mut sbr = SbrDecoder::new(1, 22050, false);
+        let mut w = BitWriter::new();
+        w.write_bits(0, crc::CRC_BITS); // transmitted checksum: wrong for what follows
+        w.write_bit(false); // header_present -- would fail differently if reached
+        for _ in 0..32 {
+            w.write_bit(true);
+        }
+        let bytes = w.finalize().to_vec();
+        let mut reader = BitReader::new(&bytes);
+
+        let err = sbr
+            .decode_extension(&mut reader, SbrElement::Single, true, bytes.len() * 8)
+            .unwrap_err();
+        assert!(format!("{err}").contains("CRC"), "unexpected error: {err}");
+    }
+
+    /// The mirror case: a correctly computed CRC must not be rejected by the
+    /// CRC check itself, whatever happens afterward while parsing the (here,
+    /// header-less) payload that follows it.
+    #[test]
+    fn a_payload_with_a_matching_crc_passes_the_crc_check() {
+        use crate::bitstream::BitWriter;
+
+        let mut sbr = SbrDecoder::new(1, 22050, false);
+        let payload_bits = 33usize; // header_present=0 plus 32 filler bits
+        let mut w = BitWriter::new();
+        w.write_bits(0, crc::CRC_BITS); // placeholder, patched below
+        w.write_bit(false);
+        for _ in 0..32 {
+            w.write_bit(true);
+        }
+        let mut bytes = w.finalize().to_vec();
+
+        let mut payload_reader = BitReader::new(&bytes);
+        payload_reader.skip_bits(crc::CRC_BITS).unwrap();
+        let real_crc = crc::checksum(&mut payload_reader, payload_bits).unwrap();
+        bytes[0] = (real_crc >> 2) as u8;
+        bytes[1] = (bytes[1] & 0x3F) | (((real_crc & 0b11) as u8) << 6);
+
+        // Pass the true intended payload length (33 bits: header_present +
+        // 32 filler), not the byte-padded buffer length -- exactly as the
+        // real fill-element caller passes the declared byte count's bits,
+        // not however many the underlying buffer happens to round up to.
+        let mut reader = BitReader::new(&bytes);
+        let err = sbr
+            .decode_extension(&mut reader, SbrElement::Single, true, crc::CRC_BITS + payload_bits)
+            .unwrap_err();
+        assert!(!format!("{err}").contains("CRC"), "a valid CRC must not fail the CRC check: {err}");
+    }
+
     /// A decoder with no header must refuse a payload rather than guess a layout.
     #[test]
     fn payload_without_a_header_is_rejected() {
@@ -650,7 +722,7 @@ mod tests {
         // A single zero bit: no header follows.
         let bytes = [0u8; 8];
         let mut reader = BitReader::new(&bytes);
-        assert!(sbr.decode_extension(&mut reader, SbrElement::Single, false).is_err());
+        assert!(sbr.decode_extension(&mut reader, SbrElement::Single, false, usize::MAX).is_err());
         assert!(!sbr.is_ready());
     }
 
@@ -703,7 +775,7 @@ mod tests {
                 .collect();
             for element in [SbrElement::Single, SbrElement::Pair] {
                 let mut reader = BitReader::new(&bytes);
-                let _ = sbr.decode_extension(&mut reader, element, seed % 3 == 0);
+                let _ = sbr.decode_extension(&mut reader, element, seed % 3 == 0, bytes.len() * 8);
                 for ch in 0..2 {
                     let _ = sbr.process_channel(ch, &core, &mut out);
                     assert!(out.iter().all(|v| v.is_finite()), "seed {seed} produced non-finite output");

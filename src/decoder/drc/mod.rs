@@ -25,6 +25,12 @@
 use crate::bitstream::BitReader;
 use crate::error::Result;
 
+pub mod channel_layout;
+pub mod downmix_instructions;
+pub mod gain_modifiers;
+pub mod gain_set_params;
+pub mod loudness_info;
+
 /// Frequency bands one payload may divide the spectrum into.
 pub const MAX_DRC_BANDS: usize = 16;
 /// Spectral lines each unit of `drc_band_top` stands for.

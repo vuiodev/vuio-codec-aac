@@ -1,70 +1,82 @@
-//! MPEG Surround (MPS) Multi-Channel Spatial Audio Decoder
+//! MPEG Surround (MPS) multi-channel spatial audio decoder — **not implemented**.
 //!
-//! Decodes multi-channel audio (5.1, 7.1, and 3D binaural) from transmitted
-//! downmix channels and spatial cue parameters: Channel Level Differences (CLD),
-//! Inter-channel Coherence (ICC), Channel Prediction Coefficients (CPC), and phase cues
-//! (ISO/IEC 23003-1).
+//! MPEG Surround (ISO/IEC 23003-1) reconstructs a multichannel signal from a
+//! transmitted downmix plus spatial cues: Channel Level Differences (CLD),
+//! Inter-channel Coherence (ICC), Channel Prediction Coefficients (CPC) and
+//! phase cues. The real decoder parses a spatial-specific config, runs the
+//! downmix through a hybrid QMF filterbank, builds per-band M1/M2 matrices for
+//! the signalled tree configuration, synthesises decorrelated channels, applies
+//! temporal shaping, and inverts the filterbank.
+//!
+//! None of that is here. This module exists so the gap has a name and an
+//! address, not because any of it works.
+//!
+//! # Why this is an error and not an approximation
+//!
+//! An earlier revision of this file shipped a fixed matrix upmix — it computed
+//! `c = 0.5*(l+r)`, derived surrounds by subtraction, and returned that as
+//! "MPEG Surround". It read no bitstream and used none of the transmitted cues,
+//! so it produced confident, plausible, wrong output for every input, and its
+//! doc comment claimed otherwise. That is the failure mode this port treats as
+//! worse than a missing feature, so the fabricated maths is gone and
+//! [`MpsDecoder::decode`] refuses instead.
+//!
+//! If you want a matrix upmix, write one at the call site where its limits are
+//! visible. Do not let it wear this module's name.
+//!
+//! # Porting this for real
+//!
+//! `text/plan.txt` phase 9 has the breakdown: ~35,300 lines of C across
+//! `c/libxaac/decoder/ixheaacd_mps_*.c`, the largest single subsystem in the
+//! reference. Start at `ixheaacd_mps_parse.c` and `ixheaacd_mps_bitdec.c` for
+//! the config and payload, then the filterbanks, then the M1/M2 matrices.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// MPEG Surround spatial parameters for 5.1 / 7.1 surround synthesis.
+///
+/// Kept as the shape the real decoder will fill in; nothing populates it today.
 #[derive(Debug, Clone, Default)]
 pub struct MpsSpatialCues {
+    /// Channel Level Differences, per parameter band.
     pub cld: Vec<f32>,
+    /// Inter-channel Coherence, per parameter band.
     pub icc: Vec<f32>,
+    /// Channel Prediction Coefficients, per parameter band.
     pub cpc: Vec<f32>,
 }
 
-/// MPEG Surround Spatial Audio Renderer.
+/// MPEG Surround spatial audio renderer.
 pub struct MpsDecoder {
-    tree_config: u8, // 0 = 5.1, 1 = 7.1, 2 = Binaural
+    tree_config: u8,
 }
 
 impl MpsDecoder {
-    /// Create new MPEG Surround decoder for specified surround output configuration.
+    /// Create a decoder for a signalled tree configuration (0 = 5.1, 1 = 7.1,
+    /// 2 = binaural).
     pub fn new(tree_config: u8) -> Self {
         Self { tree_config }
     }
 
-    /// Tree configuration.
+    /// The tree configuration this decoder was constructed for.
     pub fn tree_config(&self) -> u8 {
         self.tree_config
     }
 
-    /// Render 2-channel stereo downmix to 6-channel 5.1 surround PCM output.
-    pub fn decode_5point1(
+    /// Render a downmix to its multichannel output.
+    ///
+    /// Always returns [`Error::Unimplemented`]. See this module's documentation
+    /// for why it refuses rather than approximating.
+    pub fn decode(
         &self,
-        stereo_left: &[f32],
-        stereo_right: &[f32],
+        _downmix: &[&[f32]],
         _cues: &MpsSpatialCues,
-        out_5point1: &mut [Vec<f32>], // [Center, Left, Right, L_Surround, R_Surround, LFE]
+        _out: &mut [Vec<f32>],
     ) -> Result<()> {
-        assert_eq!(stereo_left.len(), stereo_right.len());
-        assert_eq!(out_5point1.len(), 6);
-
-        let count = stereo_left.len();
-        for ch in out_5point1.iter_mut() {
-            ch.resize(count, 0.0);
-        }
-
-        // M1 / M2 Spatial Up-mixing matrix for standard 5.1 audio layout
-        for i in 0..count {
-            let l = stereo_left[i];
-            let r = stereo_right[i];
-            let c = 0.5 * (l + r);
-            let s_l = l - 0.5 * c;
-            let s_r = r - 0.5 * c;
-            let lfe = 0.25 * (l + r);
-
-            out_5point1[0][i] = c;       // Center
-            out_5point1[1][i] = l;       // Left Front
-            out_5point1[2][i] = r;       // Right Front
-            out_5point1[3][i] = s_l;     // Left Surround
-            out_5point1[4][i] = s_r;     // Right Surround
-            out_5point1[5][i] = lfe;     // LFE (Subwoofer)
-        }
-
-        Ok(())
+        Err(Error::Unimplemented {
+            tool: "MPEG Surround decode",
+            detail: "text/plan.txt phase 9; c/libxaac/decoder/ixheaacd_mps_*.c",
+        })
     }
 }
 
@@ -72,17 +84,16 @@ impl MpsDecoder {
 mod tests {
     use super::*;
 
+    /// The contract is that this refuses. If someone reintroduces a fabricated
+    /// upmix, this test is what fails.
     #[test]
-    fn test_mps_5point1_upmixing() {
+    fn decoding_is_refused_rather_than_approximated() {
         let mps = MpsDecoder::new(0);
-        let left = vec![1.0f32; 1024];
-        let right = vec![0.5f32; 1024];
-        let cues = MpsSpatialCues::default();
-        let mut out = vec![vec![0.0f32; 1024]; 6];
-
-        mps.decode_5point1(&left, &right, &cues, &mut out).unwrap();
-        assert_eq!(out[0][0], 0.75); // Center
-        assert_eq!(out[1][0], 1.0);  // Left
-        assert_eq!(out[2][0], 0.5);  // Right
+        let left = vec![1.0f32; 512];
+        let right = vec![0.5f32; 512];
+        let mut out = vec![vec![0.0f32; 512]; 6];
+        let err = mps.decode(&[&left, &right], &MpsSpatialCues::default(), &mut out).unwrap_err();
+        assert!(matches!(err, Error::Unimplemented { .. }));
+        assert!(out.iter().all(|ch| ch.iter().all(|s| *s == 0.0)), "output must be untouched");
     }
 }

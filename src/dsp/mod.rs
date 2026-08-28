@@ -10,6 +10,7 @@ pub mod lpc;
 pub mod math;
 pub mod imdct;
 pub mod mdct;
+pub mod peak_limiter;
 pub mod qmf;
 pub mod resampler;
 pub mod simd;

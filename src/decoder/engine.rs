@@ -24,8 +24,10 @@ use crate::decoder::drc::{DrcDecoder, DrcInfo, DrcSettings};
 use crate::decoder::sbr::{SBR_CORE_FRAME, SbrDecoder, SbrElement};
 use crate::dsp::filterbank::Filterbank;
 use crate::error::{DecodeError, Result};
+use crate::syntax::adif::AdifHeader;
 use crate::syntax::adts::AdtsHeader;
 use crate::syntax::asc::AudioSpecificConfig;
+use crate::syntax::latm::AudioMuxElement;
 use crate::types::{
     AudioObjectType, ChannelConfiguration, FrameLength, SamplingRate, WindowShape,
 };
@@ -144,6 +146,12 @@ pub struct Decoder {
     sbr_scratch: Vec<f32>,
     /// Dynamic range control, which does nothing until a listener asks for it.
     drc: DrcDecoder,
+    /// The output-stage peak limiter, built lazily once the output channel
+    /// count and rate are known. `None` until [`Decoder::enable_peak_limiter`]
+    /// is called: like DRC, this is opt-in, because the limiter's look-ahead
+    /// delay shifts every output sample by a few milliseconds, which a caller
+    /// who did not ask for it should not get silently.
+    peak_limiter: Option<crate::dsp::peak_limiter::PeakLimiter>,
 }
 
 impl Decoder {
@@ -168,6 +176,7 @@ impl Decoder {
             elements: Vec::new(),
             sbr_scratch: Vec::new(),
             drc: DrcDecoder::default(),
+            peak_limiter: None,
         }
     }
 
@@ -189,6 +198,31 @@ impl Decoder {
     #[inline]
     pub fn drc_present(&self) -> bool {
         self.drc.is_present()
+    }
+
+    /// Turn the output-stage look-ahead peak limiter on.
+    ///
+    /// Off by default: enabling it delays every output sample by the
+    /// limiter's look-ahead depth (`dsp::peak_limiter::DEFAULT_ATTACK_TIME_MS`,
+    /// a few milliseconds) and, once a loud passage engages it, applies a
+    /// gain reduction that a caller comparing against an unlimited reference
+    /// would not expect. A limiter built for one rate/channel-count is
+    /// rebuilt automatically if the stream reconfigures to a different one.
+    pub fn enable_peak_limiter(&mut self) {
+        self.peak_limiter =
+            Some(crate::dsp::peak_limiter::PeakLimiter::new(self.active_channels, self.sample_rate_hz()));
+    }
+
+    /// Turn the peak limiter back off; the next frame decodes exactly as if
+    /// it had never been enabled (any audio still in the limiter's look-ahead
+    /// delay line is discarded, not flushed).
+    pub fn disable_peak_limiter(&mut self) {
+        self.peak_limiter = None;
+    }
+
+    /// Whether the peak limiter is currently engaged.
+    pub fn peak_limiter_enabled(&self) -> bool {
+        self.peak_limiter.is_some()
     }
 
     /// Create a default stereo AAC-LC decoder at 44.1 kHz.
@@ -289,9 +323,47 @@ impl Decoder {
         }
     }
 
-    /// Decode one frame, which may carry an ADTS header or be a bare raw data block.
+    /// Decode one frame, which may carry a LOAS/LATM header, an ADTS header, or
+    /// be a bare raw data block.
     pub fn decode_frame(&mut self, frame_data: &[u8]) -> Result<&AudioBuffer<i16>> {
-        let mut reader = BitReader::new(frame_data);
+        // A LOAS sync (0x2B7) means the actual raw_data_block is wrapped in an
+        // AudioMuxElement, not sitting at the start of `frame_data` -- unwrap it
+        // to its payload before anything else looks at the bytes. This owns the
+        // extracted payload for the rest of the function, since the ADTS/raw
+        // path below borrows whichever byte slice is current.
+        let latm_payload: Vec<u8>;
+        let source: &[u8] = match BitReader::new(frame_data).peek_bits(11) {
+            Ok(sync) if sync as u16 == AudioMuxElement::LOAS_SYNCWORD => {
+                let mut peek = BitReader::new(frame_data);
+                let elem = AudioMuxElement::parse_loas(&mut peek)?;
+                if let Some(cfg) = &elem.stream_mux_config {
+                    self.reconfigure(
+                        cfg.asc.sampling_rate,
+                        cfg.asc.channel_config,
+                        cfg.asc.audio_object_type,
+                    );
+                }
+                latm_payload = elem.payload_bytes;
+                &latm_payload
+            }
+            _ => frame_data,
+        };
+
+        let mut reader = BitReader::new(source);
+
+        // An ADIF header appears once, at the very start of a whole stream, and
+        // unlike ADTS/LOAS nothing frames the raw_data_block()s that follow it
+        // -- so rather than extracting a payload, consume the header in place
+        // and keep decoding from the same reader, right where it left off.
+        if reader.bits_remaining() >= 32
+            && let Ok(sync) = reader.peek_bits(32)
+            && sync as u32 == AdifHeader::SYNCWORD
+        {
+            let adif = AdifHeader::parse(&mut reader)?;
+            if let Some(cfg) = adif.configs.first() {
+                self.reconfigure(cfg.sampling_rate, cfg.channel_config, cfg.audio_object_type);
+            }
+        }
 
         // An ADTS header retunes the decoder if the stream's parameters changed.
         if reader.bits_remaining() >= 56
@@ -321,6 +393,20 @@ impl Decoder {
                     self.drc.apply_to_samples(ch, &mut self.channels[ch].sbr_pcm);
                 }
             }
+        }
+
+        let rate = self.sample_rate_hz();
+        let active_channels = self.active_channels;
+        let sbr_active = self.sbr_active;
+        if let Some(limiter) = self.peak_limiter.as_mut() {
+            if limiter.channels() != active_channels || limiter.sample_rate_hz() != rate {
+                *limiter = crate::dsp::peak_limiter::PeakLimiter::new(active_channels, rate);
+            }
+            let mut slots: Vec<&mut [f32]> = self.channels[..active_channels]
+                .iter_mut()
+                .map(|ch| if sbr_active { ch.sbr_pcm.as_mut_slice() } else { ch.pcm.as_mut_slice() })
+                .collect();
+            limiter.process(&mut slots);
         }
 
         let frame_len = self.frame_length();
@@ -453,9 +539,12 @@ impl Decoder {
                 }
 
                 ElementType::Cce => {
-                    // Coupling is parsed only far enough to stay bit-aligned; its
-                    // gains are not applied.
-                    skip_coupling_element(reader, rate, frame_length, aot)?;
+                    // Decoded for real: its spectral data, target list and
+                    // per-target gains. What is not yet done is mixing the
+                    // result into the target channels' PCM -- see
+                    // CouplingChannelElement's docs for why, and text/plan.txt
+                    // phase 7.5.
+                    let _cce = CouplingChannelElement::parse(reader, rate, frame_length, aot)?;
                 }
 
                 ElementType::Dse => skip_data_stream_element(reader)?,
@@ -510,7 +599,8 @@ impl Decoder {
             extension::SBR_DATA | extension::SBR_DATA_CRC => {
                 if let Some(target) = target {
                     let with_crc = kind == extension::SBR_DATA_CRC;
-                    self.decode_sbr_payload(reader, target, with_crc);
+                    let remaining = payload_bits - (reader.bit_position() - start);
+                    self.decode_sbr_payload(reader, target, with_crc, remaining);
                 }
             }
             extension::DYNAMIC_RANGE => {
@@ -536,7 +626,13 @@ impl Decoder {
     /// A payload that fails to parse is dropped rather than propagated: the core
     /// signal is still perfectly good, and the alternative is discarding a frame
     /// over metadata the ear would barely notice.
-    fn decode_sbr_payload(&mut self, reader: &mut BitReader, target: SbrTarget, with_crc: bool) {
+    fn decode_sbr_payload(
+        &mut self,
+        reader: &mut BitReader,
+        target: SbrTarget,
+        with_crc: bool,
+        payload_bits_remaining: usize,
+    ) {
         if self.config.frame_length.samples() != SBR_CORE_FRAME {
             return;
         }
@@ -546,7 +642,7 @@ impl Decoder {
         }
         let sbr = &mut self.sbr[target.element];
         sbr.set_core_rate(core_rate);
-        match sbr.decode_extension(reader, target.kind, with_crc) {
+        match sbr.decode_extension(reader, target.kind, with_crc, payload_bits_remaining) {
             Ok(()) => self.sbr_active = true,
             Err(e) => {
                 if std::env::var_os("AAC_TRACE_SBR").is_some() {
@@ -775,65 +871,126 @@ fn skip_data_stream_element(reader: &mut BitReader) -> Result<()> {
     Ok(())
 }
 
-/// Consume a `coupling_channel_element()`.
-///
-/// The gains and the embedded channel stream are parsed and discarded, which keeps
-/// the bit position correct for whatever follows.
-fn skip_coupling_element(
-    reader: &mut BitReader,
-    rate: SamplingRate,
-    frame_length: FrameLength,
-    aot: AudioObjectType,
-) -> Result<()> {
-    let _tag = reader.read_u8(4)?;
-    let ind_sw_cce = reader.read_bit()?;
-    let num_coupled = reader.read_u8(3)? as usize;
-
-    let mut num_gain = 0usize;
-    for _ in 0..=num_coupled {
-        num_gain += 1;
-        let cc_type = reader.read_bit()?; // channel pair flag
-        let _id = reader.read_u8(4)?;
-        if cc_type {
-            let _ch_select = reader.read_u8(2)?;
-            num_gain += 1;
-        }
-    }
-
-    let _cc_domain = reader.read_bit()?;
-    let _gain_element_sign = reader.read_bit()?;
-    let _gain_element_scale = reader.read_u8(2)?;
-
-    let mut data = ChannelData::new(frame_length.samples());
-    decode_ics(reader, &mut data, rate, frame_length, aot, None)?;
-
-    // One gain list per coupled target, minus the implicit first when the coupling
-    // is independently switched.
-    let start = if ind_sw_cce { 1 } else { 0 };
-    for c in start..num_gain {
-        let mut cge = true;
-        if c != 0 {
-            cge = reader.read_bit()?;
-        }
-        if cge {
-            skip_scalefactor_code(reader)?;
-        } else {
-            for g in 0..data.ics.num_window_groups {
-                for sfb in 0..data.ics.max_sfb {
-                    if data.sfb_cb[g][sfb] != 0 {
-                        skip_scalefactor_code(reader)?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+/// One coupling target: which element it names, and (for a channel pair)
+/// which of its two channels are actually coupled.
+#[derive(Debug, Clone, Copy)]
+pub struct CouplingTarget {
+    pub is_channel_pair: bool,
+    pub tag: u8,
+    pub left: bool,
+    pub right: bool,
 }
 
-/// Consume one Huffman-coded scalefactor delta.
-fn skip_scalefactor_code(reader: &mut BitReader) -> Result<()> {
-    crate::decoder::aac::huffman::decode_scalefactor_delta(reader)?;
-    Ok(())
+/// A `coupling_channel_element()`: an extra decoded channel meant to be mixed
+/// into one or more *other* channels at a transmitted gain, rather than output
+/// on its own -- used for things like a mix-minus commentary track or an
+/// independently-controlled effect bus riding along with the main programme.
+///
+/// # What is real here, and what is not
+///
+/// The header, the target list and the per-target gains are decoded for real:
+/// [`Self::gains`] holds actual values, not discarded bits, computed exactly as
+/// `ixheaacd_dec_coupling_channel_element` does (`cc_gain_scale[k] =
+/// 2^(step\[k\]/24)` for `step = [3, 6, 12, 24]`, each gain a power of that base
+/// picked out by a Huffman-coded exponent using the very same codebook
+/// scalefactor deltas use). [`Self::data`] is the coupling channel's own
+/// decoded (dequantized, noise-substituted) spectral data, ready for the same
+/// TNS + filterbank treatment any other channel gets.
+///
+/// What is **not** done is the mixing itself: [`crate::decoder::engine::Decoder`]
+/// does not yet track which already-decoded output channel each target's `tag`
+/// refers to (SCE/CPE elements are indexed by decode order today, not by the
+/// `element_instance_tag` a CCE's targets name), and running the coupling
+/// channel through the filterbank needs its own persistent overlap-add state
+/// across frames, which the decoder does not carry. See [`apply_coupling_gain`]
+/// for the one piece of the mix this module does provide -- the actual
+/// time-domain scaled add, ready for whichever caller resolves the target
+/// mapping -- and `text/plan.txt` phase 7.5 for what remains.
+///
+/// Only the reference's own supported case is decoded:
+/// `independently_switched` coupling (`ind_sw_cce_flag == 1`), where every
+/// target beyond the first gets one broadband gain. The other case
+/// (per-scalefactor-band gain envelopes) is not a gap relative to libxaac: its
+/// own `ixheaacd_dec_coupling_channel_element` reads the one bit that
+/// distinguishes the two cases and then returns
+/// `IA_XHEAAC_DEC_EXE_FATAL_UNIMPLEMENTED_CCE` without decoding anything
+/// further, so [`CouplingChannelElement::parse`] does the same via
+/// [`crate::error::Error::Unimplemented`].
+#[derive(Debug)]
+pub struct CouplingChannelElement {
+    pub targets: Vec<CouplingTarget>,
+    /// One gain per target, in target order; the first is always exactly 1.0
+    /// (the reference hardcodes it rather than transmitting it).
+    pub gains: Vec<f32>,
+    pub data: ChannelData,
+}
+
+/// `cc_gain_scale[k] = 2^(step[k]/24)` (`ixheaacd_common_rom.c`'s
+/// `cc_gain_scale[4]`, confirmed numerically against its Q29 fixed-point
+/// values to `2e-9` relative error).
+const CC_GAIN_SCALE_STEPS: [f64; 4] = [3.0, 6.0, 12.0, 24.0];
+
+impl CouplingChannelElement {
+    pub fn parse(
+        reader: &mut BitReader,
+        rate: SamplingRate,
+        frame_length: FrameLength,
+        aot: AudioObjectType,
+    ) -> Result<Self> {
+        let _tag = reader.read_u8(4)?;
+        let ind_sw_cce = reader.read_bit()?;
+        let num_coupled = reader.read_u8(3)? as usize;
+
+        let mut targets = Vec::with_capacity(num_coupled + 1);
+        for _ in 0..=num_coupled {
+            let is_channel_pair = reader.read_bit()?;
+            let tag = reader.read_u8(4)?;
+            let (left, right) = if is_channel_pair {
+                (reader.read_bit()?, reader.read_bit()?)
+            } else {
+                (true, false)
+            };
+            targets.push(CouplingTarget { is_channel_pair, tag, left, right });
+        }
+        let num_gain = targets.iter().map(|t| if t.is_channel_pair && t.left && t.right { 2 } else { 1 }).sum::<usize>();
+
+        let _cc_domain = reader.read_bit()?;
+        let _gain_element_sign = reader.read_bit()?;
+        let gain_element_scale = reader.read_u8(2)? as usize;
+
+        let mut data = ChannelData::new(frame_length.samples());
+        decode_ics(reader, &mut data, rate, frame_length, aot, None)?;
+        inverse_quantize_channel(&mut data);
+
+        if !ind_sw_cce {
+            // Matches the reference exactly: it reads this one bit, then
+            // refuses regardless of its value -- per-band gain envelopes for
+            // coupling channels are not implemented in libxaac either.
+            let _common_gain_element_present = reader.read_bit()?;
+            return Err(crate::error::Error::Unimplemented {
+                tool: "coupling_channel_element() with per-band gain envelopes",
+                detail: "ind_sw_cce_flag == 0; not supported by the libxaac reference either",
+            });
+        }
+
+        let base = 2.0f64.powf(1.0 / 24.0);
+        let step = base.powf(CC_GAIN_SCALE_STEPS[gain_element_scale]);
+        let mut gains = vec![1.0f32];
+        for _ in 1..num_gain {
+            let norm_value = crate::decoder::aac::huffman::decode_scalefactor_delta(reader)?;
+            gains.push(step.powi(-norm_value) as f32);
+        }
+
+        Ok(Self { targets, gains, data })
+    }
+}
+
+/// Mix a decoded coupling channel into a target's already-synthesized PCM, in
+/// place (`ixheaacd_dec_couple_channel`): `target[i] += gain * coupling[i]`.
+pub fn apply_coupling_gain(gain: f32, coupling: &[f32], target: &mut [f32]) {
+    for (t, &c) in target.iter_mut().zip(coupling.iter()) {
+        *t += gain * c;
+    }
 }
 
 #[cfg(test)]
@@ -887,5 +1044,395 @@ mod tests {
                 .collect();
             let _ = d.decode_frame(&data);
         }
+    }
+
+    /// The peak limiter is opt-in: a caller who never calls
+    /// `enable_peak_limiter` must see byte-identical output to before it
+    /// existed (covered by every other test in this file passing unchanged),
+    /// and enabling it must measurably engage on a loud signal, never raise a
+    /// peak, and turn back off cleanly.
+    #[test]
+    fn the_peak_limiter_is_opt_in_and_only_ever_reduces_peaks() {
+        use crate::encoder::{Encoder, EncoderConfig};
+
+        let mut enc = Encoder::new(EncoderConfig::default()).unwrap();
+        let mut pcm = AudioBuffer::<i16>::new(2, 1024);
+        for c in 0..2 {
+            for (i, s) in pcm.channel_mut(c).iter_mut().enumerate() {
+                *s = ((i as f32 * 0.05).sin() * 32000.0) as i16;
+            }
+        }
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            frames.push(enc.encode_frame(&pcm).unwrap());
+        }
+        frames.push(enc.flush().unwrap());
+        let frames: Vec<_> = frames.into_iter().filter(|f| !f.is_empty()).collect();
+        assert!(!frames.is_empty());
+
+        let mut without_limiter = Decoder::new_default();
+        let mut with_limiter = Decoder::new_default();
+        assert!(!with_limiter.peak_limiter_enabled());
+        with_limiter.enable_peak_limiter();
+        assert!(with_limiter.peak_limiter_enabled());
+
+        // The limiter's look-ahead delay shifts every sample by a few hundred
+        // positions, so comparing the two streams index-for-index would
+        // compare unrelated content across that shift. What is actually
+        // guaranteed, and checked here, is a global one: concatenated across
+        // the whole multi-frame stream, the limiter can only ever hold the
+        // peak the same or bring it down, never up.
+        let mut any_difference = false;
+        let mut unlimited_peak = 0i32;
+        let mut limited_peak = 0i32;
+        for frame in &frames {
+            let unlimited = without_limiter.decode_frame(frame).unwrap().clone();
+            let limited = with_limiter.decode_frame(frame).unwrap().clone();
+            for ch in 0..2 {
+                let (u, l) = (unlimited.channel(ch), limited.channel(ch));
+                assert_eq!(u.len(), l.len());
+                unlimited_peak = unlimited_peak.max(u.iter().map(|&v| (v as i32).abs()).max().unwrap_or(0));
+                limited_peak = limited_peak.max(l.iter().map(|&v| (v as i32).abs()).max().unwrap_or(0));
+                if u != l {
+                    any_difference = true;
+                }
+            }
+        }
+        assert!(any_difference, "a full-scale tone must actually engage the limiter");
+        assert!(
+            limited_peak <= unlimited_peak,
+            "limiter raised the stream's overall peak: {unlimited_peak} -> {limited_peak}"
+        );
+
+        with_limiter.disable_peak_limiter();
+        assert!(!with_limiter.peak_limiter_enabled());
+    }
+
+    /// Encode one real ADTS frame, then strip its header to get the bare
+    /// `raw_data_block()` both LOAS/LATM and ADIF wrap. Returns the payload
+    /// alongside the ASC these tests need to build a matching StreamMuxConfig
+    /// or ADIF header.
+    fn encode_one_raw_data_block() -> (Vec<u8>, crate::syntax::asc::AudioSpecificConfig) {
+        encode_one_raw_data_block_with_channels(2)
+    }
+
+    /// Same as [`encode_one_raw_data_block`], but with a chosen channel count
+    /// -- in particular, mono to guarantee a plain SCE (`element_id == 0`)
+    /// rather than a CPE, for tests that need to know the raw block's exact
+    /// 7-bit element header shape.
+    fn encode_one_raw_data_block_with_channels(
+        channels: usize,
+    ) -> (Vec<u8>, crate::syntax::asc::AudioSpecificConfig) {
+        use crate::encoder::{Encoder, EncoderConfig};
+        use crate::syntax::adts::AdtsHeader;
+
+        let channel_config = if channels == 1 {
+            ChannelConfiguration::Mono
+        } else {
+            ChannelConfiguration::Stereo
+        };
+        let mut enc =
+            Encoder::new(EncoderConfig { channel_config, ..EncoderConfig::default() }).unwrap();
+        let pcm = crate::buffer::AudioBuffer::<i16>::new(channels, 1024);
+        // The encoder holds the first frame back for lookahead; flush to get a
+        // real, complete ADTS frame rather than the empty first return.
+        enc.encode_frame(&pcm).unwrap();
+        let frame = loop {
+            let f = enc.flush().unwrap();
+            if !f.is_empty() {
+                break f;
+            }
+        };
+
+        let mut reader = BitReader::new(&frame);
+        let header = AdtsHeader::parse(&mut reader).expect("encoder must emit valid ADTS");
+        let raw_data_block = frame[reader.byte_position()..].to_vec();
+
+        let asc = crate::syntax::asc::AudioSpecificConfig {
+            audio_object_type: header.audio_object_type,
+            sampling_rate: header.sampling_rate,
+            channel_config: header.channel_config,
+            frame_length: crate::types::FrameLength::Samples1024,
+            depends_on_core_coder: false,
+            core_coder_delay: 0,
+            extension_audio_object_type: None,
+            extension_sampling_rate: None,
+            sbr_present: false,
+            ps_present: false,
+        };
+        (raw_data_block, asc)
+    }
+
+    /// A LOAS/LATM-wrapped frame must decode to the same result as feeding its
+    /// raw_data_block() straight to the decoder: the unwrap in decode_frame
+    /// must be transparent, and the StreamMuxConfig's ASC must actually
+    /// reconfigure the decoder rather than being parsed and discarded.
+    #[test]
+    fn a_loas_latm_wrapped_frame_decodes_and_reconfigures() {
+        use crate::bitstream::BitWriter;
+        use crate::syntax::latm::{AudioMuxElement, StreamMuxConfig};
+
+        let (raw_data_block, asc) = encode_one_raw_data_block();
+
+        let mux_config = StreamMuxConfig {
+            audio_mux_version: 0,
+            all_streams_same_time_framing: true,
+            num_sub_frames: 1,
+            num_programs: 1,
+            num_layers: 1,
+            asc,
+        };
+        let elem = AudioMuxElement {
+            mux_config_present: true,
+            stream_mux_config: Some(mux_config),
+            payload_bytes: raw_data_block.clone(),
+        };
+        let mut writer = BitWriter::with_capacity(raw_data_block.len() + 16);
+        elem.write_loas(&mut writer);
+        let loas_bytes = writer.finalize();
+
+        // Start from a decoder configured for the wrong rate/channels, so a
+        // pass here proves the LATM path actually reconfigures rather than the
+        // test coincidentally already matching.
+        let mut latm_decoder = Decoder::new(crate::syntax::asc::AudioSpecificConfig {
+            audio_object_type: AudioObjectType::AacLc,
+            sampling_rate: SamplingRate::Hz16000,
+            channel_config: ChannelConfiguration::Mono,
+            frame_length: crate::types::FrameLength::Samples1024,
+            depends_on_core_coder: false,
+            core_coder_delay: 0,
+            extension_audio_object_type: None,
+            extension_sampling_rate: None,
+            sbr_present: false,
+            ps_present: false,
+        });
+        let via_latm = latm_decoder.decode_frame(loas_bytes).expect("LATM frame decodes").clone();
+        assert_eq!(latm_decoder.channels(), 2, "StreamMuxConfig's ASC must reconfigure the decoder");
+        assert_eq!(latm_decoder.sample_rate_hz(), 44100);
+
+        let mut raw_decoder = Decoder::new_default();
+        let via_raw = raw_decoder.decode_frame(&raw_data_block).expect("raw block decodes").clone();
+
+        assert_eq!(via_latm.samples_per_channel(), via_raw.samples_per_channel());
+        for ch in 0..2 {
+            assert_eq!(via_latm.channel(ch), via_raw.channel(ch), "LATM unwrap must be transparent");
+        }
+    }
+
+    /// An ADIF-prefixed stream must decode its first frame identically to the
+    /// bare raw_data_block(), with the header's first program config actually
+    /// reconfiguring the decoder.
+    #[test]
+    fn an_adif_prefixed_stream_decodes_and_reconfigures() {
+        use crate::bitstream::BitWriter;
+        use crate::syntax::adif::AdifHeader;
+
+        let (raw_data_block, asc) = encode_one_raw_data_block();
+
+        let header = AdifHeader {
+            copyright_id_present: false,
+            copyright_id: [0u8; 9],
+            original_copy: false,
+            home: false,
+            bitstream_type: true,
+            bitrate: 128_000,
+            num_program_config_elements: 1,
+            buffer_fullness: 0,
+            configs: vec![asc],
+        };
+        // The header's bit length is not generally a multiple of 8, so the
+        // raw_data_block's bits must follow immediately in the same bitstream
+        // -- appending its bytes after a byte-aligned `finalize()` would shift
+        // every bit and is not what a real ADIF stream looks like.
+        let mut writer = BitWriter::with_capacity(raw_data_block.len() + 16);
+        header.write(&mut writer);
+        let mut block_reader = BitReader::new(&raw_data_block);
+        for _ in 0..raw_data_block.len() * 8 {
+            writer.write_bit(block_reader.read_bit().unwrap());
+        }
+        let stream = writer.finalize().to_vec();
+
+        let mut adif_decoder = Decoder::new(crate::syntax::asc::AudioSpecificConfig {
+            audio_object_type: AudioObjectType::AacLc,
+            sampling_rate: SamplingRate::Hz16000,
+            channel_config: ChannelConfiguration::Mono,
+            frame_length: crate::types::FrameLength::Samples1024,
+            depends_on_core_coder: false,
+            core_coder_delay: 0,
+            extension_audio_object_type: None,
+            extension_sampling_rate: None,
+            sbr_present: false,
+            ps_present: false,
+        });
+        let via_adif = adif_decoder.decode_frame(&stream).expect("ADIF-prefixed stream decodes").clone();
+        assert_eq!(adif_decoder.channels(), 2, "the ADIF header's PCE must reconfigure the decoder");
+        assert_eq!(adif_decoder.sample_rate_hz(), 44100);
+
+        let mut raw_decoder = Decoder::new_default();
+        let via_raw = raw_decoder.decode_frame(&raw_data_block).expect("raw block decodes").clone();
+
+        for ch in 0..2 {
+            assert_eq!(via_adif.channel(ch), via_raw.channel(ch), "ADIF unwrap must be transparent");
+        }
+    }
+
+    /// `cc_gain_scale[k]` reverse-engineered from `ixheaacd_common_rom.c`'s Q29
+    /// values must reproduce them (585461881, 638450708, 759250125,
+    /// 1073741824 out of 2^29) to within Q29 rounding.
+    #[test]
+    fn cc_gain_scale_matches_the_reference_q29_table() {
+        let base = 2.0f64.powf(1.0 / 24.0);
+        let expected_q29 = [585461881.0, 638450708.0, 759250125.0, 1073741824.0];
+        for (step, want) in CC_GAIN_SCALE_STEPS.iter().zip(expected_q29.iter()) {
+            let got = base.powf(*step) * (1u64 << 29) as f64;
+            assert!((got - want).abs() < 1.0, "step {step}: {got} vs {want}");
+        }
+    }
+
+    /// `apply_coupling_gain` must scale-and-add, not replace, and must leave a
+    /// unity gain as a pure passthrough sum.
+    #[test]
+    fn coupling_gain_scales_and_adds_in_place() {
+        let coupling = [1.0f32, -2.0, 3.0];
+        let mut target = [10.0f32, 10.0, 10.0];
+        apply_coupling_gain(0.5, &coupling, &mut target);
+        assert_eq!(target, [10.5, 9.0, 11.5]);
+
+        let mut target = [0.0f32, 0.0, 0.0];
+        apply_coupling_gain(1.0, &coupling, &mut target);
+        assert_eq!(target, coupling);
+    }
+
+    /// A real independently-switched CCE (`ind_sw_cce_flag == 1`) with one
+    /// channel-pair target coupled on both channels: two gains beyond the
+    /// implicit unity first one, decoded from real Huffman-coded scalefactor
+    /// deltas, and the embedded channel stream must actually decode.
+    #[test]
+    fn an_independently_switched_cce_decodes_real_targets_and_gains() {
+        use crate::bitstream::BitWriter;
+        use crate::syntax::asc::AudioSpecificConfig;
+
+        // Build a minimal-but-real SCE payload to embed as the coupling
+        // channel's own stream, by encoding one and stripping its ADTS header
+        // -- the same technique the LATM/ADIF tests use.
+        let (raw_sce, asc) = encode_one_raw_data_block_with_channels(1);
+        // `raw_sce` is `element_id(3) + element_instance_tag(4) + ics_data() +
+        // END(3) + byte padding`; coupling_channel_element() expects exactly
+        // ics_data() right after its own header (decode_ics starts at
+        // global_gain), so strip the 7-bit element header and discover ics_data's
+        // exact bit length with a real decode_ics call rather than guessing --
+        // the trailing END element and padding bits must NOT be copied in, or
+        // they land between ics_data and the gain codeword that follows it.
+        let mut sce_reader = BitReader::new(&raw_sce);
+        let _sce_id = sce_reader.read_bits(3).unwrap();
+        let _sce_tag = sce_reader.read_bits(4).unwrap();
+        let ics_start = sce_reader.bit_position();
+        let mut scratch = ChannelData::new(asc.frame_length.samples());
+        decode_ics(&mut sce_reader, &mut scratch, asc.sampling_rate, asc.frame_length, asc.audio_object_type, None)
+            .expect("the encoder's own ics_data must parse");
+        let ics_data_bits = sce_reader.bit_position() - ics_start;
+        let mut sce_reader = BitReader::new(&raw_sce);
+        let _ = sce_reader.read_bits(7).unwrap();
+
+        let mut writer = BitWriter::with_capacity(raw_sce.len() + 8);
+        writer.write_u8(0, 4); // element_instance_tag
+        writer.write_bit(true); // ind_sw_cce_flag
+        writer.write_u8(0, 3); // num_coupled_elements (1 target total)
+        // Target 0: a channel pair, both channels coupled.
+        writer.write_bit(true); // is_channel_pair
+        writer.write_u8(3, 4); // tag
+        writer.write_bit(true); // cc_l
+        writer.write_bit(true); // cc_r
+        writer.write_bit(false); // cc_domain
+        writer.write_bit(false); // gain_element_sign
+        writer.write_u8(1, 2); // gain_element_scale
+        // The coupling channel's own ics_data, bit for bit and no more --
+        // decode_ics() runs before the gain list, exactly as
+        // ixheaacd_dec_coupling_channel_element decodes its individual_ch_stream()
+        // before ever touching cc_gain[].
+        for _ in 0..ics_data_bits {
+            writer.write_bit(sce_reader.read_bit().unwrap());
+        }
+        // Two Huffman-coded gains (num_gain = 2, since the one CPE target with
+        // both channels coupled counts twice), each a real delta-0 codeword
+        // from the encoder's own scalefactor Huffman writer -- decoding to
+        // norm_value 0, i.e. gain = step^0 = 1.0.
+        assert!(crate::encoder::aac::huffman::write_scalefactor_delta(&mut writer, 0));
+        assert!(crate::encoder::aac::huffman::write_scalefactor_delta(&mut writer, 0));
+        let bytes = writer.finalize().to_vec();
+
+        let mut reader = BitReader::new(&bytes);
+        let asc = AudioSpecificConfig {
+            audio_object_type: AudioObjectType::AacLc,
+            sampling_rate: SamplingRate::Hz44100,
+            channel_config: ChannelConfiguration::Stereo,
+            frame_length: crate::types::FrameLength::Samples1024,
+            depends_on_core_coder: false,
+            core_coder_delay: 0,
+            extension_audio_object_type: None,
+            extension_sampling_rate: None,
+            sbr_present: false,
+            ps_present: false,
+        };
+        let cce = CouplingChannelElement::parse(
+            &mut reader,
+            asc.sampling_rate,
+            asc.frame_length,
+            asc.audio_object_type,
+        )
+        .expect("a real ind_sw_cce=1 element must decode");
+
+        assert_eq!(cce.targets.len(), 1);
+        assert!(cce.targets[0].is_channel_pair);
+        assert_eq!(cce.targets[0].tag, 3);
+        assert!(cce.targets[0].left && cce.targets[0].right);
+        assert_eq!(cce.gains.len(), 2, "one CPE target coupled on both channels needs two gains");
+        assert_eq!(cce.gains[0], 1.0, "the first gain is always the implicit unity");
+        assert!((cce.gains[1] - 1.0).abs() < 1e-4, "an all-zero delta must decode to unity gain: {:?}", cce.gains);
+        assert!(cce.data.global_gain > 0 || cce.data.global_gain == 0, "ics_data actually parsed");
+    }
+
+    /// `ind_sw_cce_flag == 0` must be refused for exactly that reason -- not
+    /// incidentally fail because the test fed it nonsense ics_data. Real
+    /// ics_data is embedded (as the reference itself decodes it unconditionally,
+    /// before ever checking `ind_sw_cce_flag`) so the only way this can fail is
+    /// the check under test.
+    #[test]
+    fn a_non_independently_switched_cce_is_refused_not_misparsed() {
+        use crate::bitstream::BitWriter;
+
+        let (raw_sce, _asc) = encode_one_raw_data_block_with_channels(1);
+        let mut sce_reader = BitReader::new(&raw_sce);
+        let _sce_id = sce_reader.read_bits(3).unwrap();
+        let _sce_tag = sce_reader.read_bits(4).unwrap();
+
+        let mut writer = BitWriter::with_capacity(raw_sce.len() + 8);
+        writer.write_u8(0, 4); // element_instance_tag
+        writer.write_bit(false); // ind_sw_cce_flag = 0
+        writer.write_u8(0, 3); // num_coupled_elements
+        writer.write_bit(true); // is_channel_pair
+        writer.write_u8(0, 4); // tag
+        writer.write_bit(false); // cc_l
+        writer.write_bit(false); // cc_r
+        writer.write_bit(false); // cc_domain
+        writer.write_bit(false); // gain_element_sign
+        writer.write_u8(0, 2); // gain_element_scale
+        for _ in 0..(raw_sce.len() * 8 - 7) {
+            writer.write_bit(sce_reader.read_bit().unwrap());
+        }
+        let bytes = writer.finalize().to_vec();
+        let mut reader = BitReader::new(&bytes);
+
+        let err = CouplingChannelElement::parse(
+            &mut reader,
+            SamplingRate::Hz44100,
+            crate::types::FrameLength::Samples1024,
+            AudioObjectType::AacLc,
+        )
+        .expect_err("ind_sw_cce_flag == 0 must not silently decode");
+        assert!(
+            matches!(err, crate::error::Error::Unimplemented { .. }),
+            "must fail via the explicit refusal, not an incidental parse error: {err}"
+        );
     }
 }

@@ -31,6 +31,21 @@ pub enum Error {
     /// Underlying standard I/O errors.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A codec tool that exists in the reference but is not implemented here.
+    ///
+    /// This is deliberately a hard error rather than a silent approximation:
+    /// a wrong answer that looks right is the worst failure mode a codec has,
+    /// so a tool this port has not reached yet refuses the work instead of
+    /// fabricating output. `text/plan.txt` tracks which tools these are and
+    /// which phase implements each.
+    #[error("{tool} is not implemented in this port yet ({detail})")]
+    Unimplemented {
+        /// The tool the caller asked for, e.g. "MPEG Surround decode".
+        tool: &'static str,
+        /// Where to look: usually the plan phase that covers it.
+        detail: &'static str,
+    },
 }
 
 /// Errors occurring during bitstream bit-level extraction and writing.

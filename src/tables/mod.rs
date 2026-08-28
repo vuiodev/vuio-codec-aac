@@ -6,6 +6,8 @@
 //! - Window lookup tables and generators (`window`)
 //! - Inverse Quantization and Dequantization tables (`dequant`)
 //! - Temporal Noise Shaping tables (`tns`)
+//! - USAC arithmetic coder, LSF codebook, RE8 lattice and ACELP tables
+//!   (`usac_arith`, `usac_lsf`, `usac_avq`, `usac_acelp`)
 
 pub mod dequant;
 pub mod huffman;
@@ -16,6 +18,8 @@ pub mod sbr;
 pub mod scalefactor;
 pub mod sfb;
 pub mod tns;
+pub mod usac_acelp;
 pub mod usac_arith;
+pub mod usac_avq;
 pub mod usac_lsf;
 pub mod window;
